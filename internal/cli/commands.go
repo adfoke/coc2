@@ -15,6 +15,7 @@ func RegisterAll(r *Registry) {
 	addMetrics(r)
 	addTransfers(r)
 	addPlugins(r)
+	addAudit(r)
 	addWriteCommands(r)
 }
 
@@ -288,4 +289,52 @@ func addPlugins(r *Registry) {
 			return Emit(g.Stdout, out, g.Pretty)
 		},
 	})
+}
+
+func addAudit(r *Registry) {
+	r.Add(&Command{
+		Name:    "audit list",
+		Summary: "Operator action log: who did what, from where, with what result",
+		Flags: []FlagSpec{
+			{Name: "limit", Type: "int", Default: "50", Desc: "max entries (<=500)"},
+			{Name: "actor", Type: "string", Desc: "only this actor (unix username on UDS, token[:name] on TCP)"},
+			{Name: "agent", Type: "string", Desc: "only ops targeting this agent id"},
+			{Name: "path", Type: "string", Desc: "only this endpoint path (exact)"},
+			{Name: "ref", Type: "string", Desc: "only ops referencing this id (task/transfer/group)"},
+			{Name: "since", Type: "string", Desc: "RFC3339 or YYYY-MM-DD (UTC)"},
+			{Name: "until", Type: "string", Desc: "RFC3339 or YYYY-MM-DD (UTC)"},
+			{Name: "failed", Type: "bool", Desc: "only rejected/failed entries (incl. auth failures)"},
+		},
+		Run: func(g *Globals, cf *CmdFlags) error {
+			var out []map[string]any
+			path := "/api/v1/oplog" + joinQuery(
+				queryInt("limit", cf.Int("limit")),
+				queryStr("actor", cf.String("actor")),
+				queryStr("agent", cf.String("agent")),
+				queryStr("path", cf.String("path")),
+				queryStr("ref", cf.String("ref")),
+				queryStr("since", cf.String("since")),
+				queryStr("until", cf.String("until")),
+				queryFlag("failed", cf.Bool("failed")),
+			)
+			if err := g.Client.Get(path, &out); err != nil {
+				return err
+			}
+			return Emit(g.Stdout, out, g.Pretty)
+		},
+	})
+}
+
+func queryStr(name, v string) string {
+	if v == "" {
+		return ""
+	}
+	return name + "=" + url.QueryEscape(v)
+}
+
+func queryFlag(name string, on bool) string {
+	if !on {
+		return ""
+	}
+	return name + "=1"
 }

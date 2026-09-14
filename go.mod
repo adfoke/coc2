@@ -7,6 +7,8 @@ require (
 	github.com/goccy/go-yaml v1.18.0
 	github.com/gorilla/websocket v1.5.3
 	go.uber.org/zap v1.27.0
+	golang.org/x/sys v0.42.0
+	google.golang.org/protobuf v1.36.9
 	modernc.org/sqlite v1.47.0
 )
 
@@ -42,10 +44,8 @@ require (
 	golang.org/x/mod v0.33.0 // indirect
 	golang.org/x/net v0.50.0 // indirect
 	golang.org/x/sync v0.19.0 // indirect
-	golang.org/x/sys v0.42.0 // indirect
 	golang.org/x/text v0.34.0 // indirect
 	golang.org/x/tools v0.42.0 // indirect
-	google.golang.org/protobuf v1.36.9 // indirect
 	modernc.org/libc v1.70.0 // indirect
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.11.0 // indirect

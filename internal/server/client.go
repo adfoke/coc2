@@ -43,6 +43,7 @@ func (a *agentConn) readLoop() {
 				continue
 			}
 			if subtle.ConstantTimeCompare([]byte(hello.Token), []byte(a.service.cfg.AuthToken)) != 1 {
+				a.service.logAgentAuthFailure(a.remoteAddr, hello.AgentID)
 				a.sendProtocolError("auth_failed", "token mismatch")
 				return
 			}

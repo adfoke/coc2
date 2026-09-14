@@ -196,6 +196,29 @@ func (s *Store) init() error {
 			created_at TEXT NOT NULL,
 			completed_at TEXT
 		);`,
+		// oplog is the operator-plane audit trail: one row per write request
+		// (task dispatch, cancel, group mutation, transfer start) plus auth
+		// failures. It answers "who did what, from where, and did it work".
+		// params_summary is redacted at write time (see oplog.go); actor is
+		// resolved from the connection (UDS peer uid / TCP client IP).
+		`CREATE TABLE IF NOT EXISTS oplog (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			request_id TEXT NOT NULL,
+			ts TEXT NOT NULL,
+			plane TEXT NOT NULL,
+			actor TEXT NOT NULL,
+			uid INTEGER NOT NULL DEFAULT -1,
+			pid INTEGER NOT NULL DEFAULT -1,
+			source TEXT NOT NULL DEFAULT '',
+			method TEXT NOT NULL,
+			path TEXT NOT NULL,
+			status INTEGER NOT NULL,
+			ok INTEGER NOT NULL DEFAULT 0,
+			ref TEXT NOT NULL DEFAULT '',
+			agents_json TEXT NOT NULL DEFAULT '[]',
+			params_summary TEXT NOT NULL DEFAULT ''
+		);`,
+		`CREATE INDEX IF NOT EXISTS idx_oplog_ts ON oplog(ts DESC);`,
 		`CREATE INDEX IF NOT EXISTS idx_tasks_agent_state_created ON tasks(agent_id, state, created_at);`,
 		`CREATE INDEX IF NOT EXISTS idx_group_members_agent ON group_members(agent_id);`,
 		`CREATE INDEX IF NOT EXISTS idx_transfer_audit_agent_created ON transfer_audit(agent_id, created_at);`,

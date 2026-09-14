@@ -68,6 +68,11 @@ type agentConn struct {
 	service   *Service
 	closeOnce sync.Once
 
+	// remoteAddr is the peer address of the underlying TCP connection,
+	// captured at upgrade time. The oplog uses it to attribute failed
+	// authentications before any agent identity exists.
+	remoteAddr string
+
 	// binaryOut flips to true once the hello exchange proves the peer
 	// speaks protobuf; reads always accept both framings by opcode.
 	binaryOut atomic.Bool
@@ -273,7 +278,16 @@ func (s *Service) listenOperatorUDS() error {
 		return fmt.Errorf("chmod operator socket: %w", err)
 	}
 	s.udsListener = ln
-	s.operatorUDSrv = &http.Server{Handler: s.engine}
+	s.operatorUDSrv = &http.Server{
+		Handler: s.engine,
+		// Attach kernel peer credentials (uid, pid on Linux) to every
+		// request context so the oplog can name the operator behind a
+		// tokenless UDS call. This is the only actor identity available
+		// on that plane, and it cannot be spoofed by the client.
+		ConnContext: func(ctx context.Context, c net.Conn) context.Context {
+			return withPeerCred(ctx, c)
+		},
+	}
 	return nil
 }
 
@@ -318,6 +332,7 @@ func (s *Service) operatorRoutes() *gin.Engine {
 	engine := gin.New()
 	engine.Use(gin.Recovery())
 	engine.Use(s.requireOperatorAuth())
+	engine.Use(s.oplogMiddleware())
 
 	engine.GET("/healthz", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"ok": true, "plane": "operator"})
@@ -372,12 +387,17 @@ func (s *Service) operatorRoutes() *gin.Engine {
 			}
 			pending += agent.PendingCount
 		}
+		oplogEntries, err := s.store.OplogCount()
+		if err != nil {
+			oplogEntries = -1
+		}
 		c.JSON(http.StatusOK, gin.H{
 			"total_agents":     len(agents),
 			"online_agents":    online,
 			"pending_tasks":    pending,
 			"active_transfers": s.activeTransfersCount(),
 			"plugins":          len(s.plugins.List()),
+			"oplog_entries":    oplogEntries,
 		})
 	})
 
@@ -579,7 +599,60 @@ func (s *Service) operatorRoutes() *gin.Engine {
 		c.JSON(http.StatusOK, transfers)
 	})
 
+	engine.GET("/api/v1/oplog", func(c *gin.Context) {
+		since, until, err := parseTimeRange(c)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		entries, err := s.store.RecentOpLogs(OpLogQuery{
+			Limit:  queryLimit(c, 50, 500),
+			Actor:  c.Query("actor"),
+			Agent:  c.Query("agent"),
+			Path:   c.Query("path"),
+			Ref:    c.Query("ref"),
+			Since:  since,
+			Until:  until,
+			Failed: c.Query("failed") == "1" || c.Query("failed") == "true",
+		})
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+		c.JSON(http.StatusOK, entries)
+	})
+
 	return engine
+}
+
+// parseTimeRange reads optional ?since=&until= RFC3339 (or RFC3339 without
+// time part tolerated via time.Parse fallbacks) query parameters.
+func parseTimeRange(c *gin.Context) (time.Time, time.Time, error) {
+	p := func(name string) (time.Time, error) {
+		raw := c.Query(name)
+		if raw == "" {
+			return time.Time{}, nil
+		}
+		t, err := time.Parse(time.RFC3339, raw)
+		if err != nil {
+			// allow date-only form, interpreted as UTC midnight
+			t, err = time.Parse("2006-01-02", raw)
+			if err != nil {
+				return time.Time{}, fmt.Errorf("%s must be RFC3339 or YYYY-MM-DD", name)
+			}
+			t = t.UTC()
+		}
+		return t, nil
+	}
+	since, err := p("since")
+	if err != nil {
+		return time.Time{}, time.Time{}, err
+	}
+	until, err := p("until")
+	if err != nil {
+		return time.Time{}, time.Time{}, err
+	}
+	return since, until, nil
 }
 
 func (s *Service) handleAgentWS(c *gin.Context) {
@@ -590,10 +663,11 @@ func (s *Service) handleAgentWS(c *gin.Context) {
 	}
 
 	agent := &agentConn{
-		conn:    conn,
-		send:    make(chan wsFrame, 16),
-		done:    make(chan struct{}),
-		service: s,
+		conn:       conn,
+		remoteAddr: c.Request.RemoteAddr,
+		send:       make(chan wsFrame, 16),
+		done:       make(chan struct{}),
+		service:    s,
 	}
 	go agent.writeLoop()
 	agent.readLoop()
@@ -759,6 +833,10 @@ func (s *Service) requireOperatorAuth() gin.HandlerFunc {
 			c.Next()
 			return
 		}
+		// Persist the rejection before answering: a rejected request that
+		// only lives in stdout is invisible to whoever asks "was someone
+		// trying our token?" after the log rotated.
+		s.logOperatorAuthFailure(c)
 		// No WWW-Authenticate: it exists to trigger browser login prompts,
 		// and there is no browser on this plane anymore.
 		c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
