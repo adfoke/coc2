@@ -21,6 +21,7 @@ const (
 	TypeFileTransferStart  = "file_transfer_start"
 	TypeFileTransferChunk  = "file_transfer_chunk"
 	TypeFileTransferResume = "file_transfer_resume"
+	TypeFileTransferCancel = "file_transfer_cancel"
 	TypeFileTransferDone   = "file_transfer_done"
 	TypeError              = "error"
 )
@@ -121,6 +122,15 @@ type FileTransferResume struct {
 	TransferID string `json:"transfer_id"`
 	AgentID    string `json:"agent_id,omitempty"`
 	Offset     int64  `json:"offset"`
+}
+
+// FileTransferCancel asks the peer to stop an in-flight transfer. The peer
+// confirms with FileTransferDone{Status: "canceled"}; partial (.part) files
+// are kept on both ends so a retry can resume.
+type FileTransferCancel struct {
+	TransferID  string    `json:"transfer_id"`
+	AgentID     string    `json:"agent_id,omitempty"`
+	RequestedAt time.Time `json:"requested_at"`
 }
 
 type FileTransferChunk struct {

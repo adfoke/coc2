@@ -19,7 +19,21 @@ const (
 	transferAuditMinBytes    = 1 << 20
 	transferResumeTimeout    = 30 * time.Second
 	transferStallTimeout     = 10 * time.Minute
+	// transferCancelGrace is how long a cancel_requested transfer waits for
+	// the agent's canceled confirmation before the reaper finalizes it.
+	transferCancelGrace = 30 * time.Second
 )
+
+// isTerminalTransferStatus reports whether a status ends the transfer's
+// lifecycle. "cancel_requested" is deliberately NOT terminal: it is an
+// intermediate state awaiting confirmation (from the agent or the reaper).
+func isTerminalTransferStatus(status string) bool {
+	switch status {
+	case "success", "failed", "canceled":
+		return true
+	}
+	return false
+}
 
 type TransferStatus struct {
 	ID               string    `json:"transfer_id"`
@@ -49,6 +63,16 @@ type transferState struct {
 	expectedChunks int
 
 	resumeCh chan int64
+
+	// cancelRequestedAt stamps the moment cancellation was requested; the
+	// reaper uses it to finalize transfers whose agent never acknowledged.
+	cancelRequestedAt time.Time
+	// cancelCh is closed (idempotently, via cancelOnce) when cancellation
+	// is requested; the upload pump selects on it so a server->agent push
+	// stops at the next chunk. Nil-safe: a nil channel never fires, and
+	// signalCancel skips it, so hand-built test states need no wiring.
+	cancelCh   chan struct{}
+	cancelOnce sync.Once
 
 	lastPersistedAt    time.Time
 	lastPersistedBytes int64
@@ -92,6 +116,7 @@ func (s *Service) startUpload(agentID, localPath, remotePath string, chunkSize i
 		ChunkSize:  chunkSize,
 		CreatedAt:  time.Now().UTC(),
 		resumeCh:   make(chan int64, 1),
+		cancelCh:   make(chan struct{}),
 	}
 	s.putTransfer(state)
 	s.persistTransfer(state)
@@ -129,6 +154,7 @@ func (s *Service) startDownload(agentID, remotePath, localPath string, chunkSize
 		BytesTransferred: offset,
 		CreatedAt:        time.Now().UTC(),
 		tempPath:         tempPath,
+		cancelCh:         make(chan struct{}),
 	}
 	s.putTransfer(state)
 	s.persistTransfer(state)
@@ -165,12 +191,19 @@ func (s *Service) runUpload(client *agentConn, state *transferState) {
 		return
 	}
 
+	// Prologue under state.mu: check cancellation and enqueue file_transfer_start
+	// atomically. WebSocket writes are ordered per connection, so holding the
+	// lock across the send serializes against cancelTransfer — the agent can
+	// never observe start-after-cancel (an orphan receiver streaming into a
+	// transfer the server already settled).
 	state.mu.Lock()
-	state.Status = "running"
-	state.ChecksumSHA256 = checksum
-	state.mu.Unlock()
-	s.persistTransfer(state)
-
+	if state.Status == "cancel_requested" {
+		// Canceled while the checksum ran (seconds on large files): never
+		// start the agent-side receiver — settle the cancel immediately.
+		state.mu.Unlock()
+		s.finalizeCanceled(state, "canceled by operator")
+		return
+	}
 	start := protocol.FileTransferStart{
 		TransferID:     state.ID,
 		AgentID:        state.AgentID,
@@ -182,13 +215,26 @@ func (s *Service) runUpload(client *agentConn, state *transferState) {
 		ChecksumSHA256: checksum,
 		RequestedAt:    time.Now().UTC(),
 	}
-	if err := client.sendMessage(protocol.TypeFileTransferStart, start); err != nil {
-		s.finishTransferWithError(state, err)
+	startErr := client.sendMessage(protocol.TypeFileTransferStart, start)
+	if startErr == nil {
+		state.Status = "running"
+		state.ChecksumSHA256 = checksum
+		s.persistTransferLocked(state)
+	}
+	state.mu.Unlock()
+	if startErr != nil {
+		s.finishTransferWithError(state, startErr)
 		return
 	}
 
 	offset, err := s.waitUploadResume(state)
 	if err != nil {
+		if errors.Is(err, errTransferCanceled) {
+			// Canceled while awaiting the agent's resume offset: same
+			// two-phase exit as the pump — stop, stay cancel_requested,
+			// let confirmation or the reaper finalize it.
+			return
+		}
 		s.finishTransferWithError(state, err)
 		return
 	}
@@ -209,6 +255,17 @@ func (s *Service) runUpload(client *agentConn, state *transferState) {
 	buf := make([]byte, state.ChunkSize)
 	seq := int(offset / int64(state.ChunkSize))
 	for {
+		select {
+		case <-state.cancelCh:
+			// Operator canceled: stop pumping and leave the transfer in
+			// cancel_requested. The terminal status comes from the agent's
+			// FileTransferDone confirmation (a racing completion still
+			// records success — the file really did land), or from the
+			// reaper once the grace window expires. Same two-phase shape
+			// as task cancellation.
+			return
+		default:
+		}
 		n, readErr := file.Read(buf)
 		if n > 0 {
 			chunk := protocol.FileTransferChunk{
@@ -259,12 +316,18 @@ func (s *Service) runUpload(client *agentConn, state *transferState) {
 	}
 }
 
+// errTransferCanceled sentinels a pump exit caused by cancellation; the
+// caller must finalize as canceled, never as failed.
+var errTransferCanceled = errors.New("transfer canceled")
+
 func (s *Service) waitUploadResume(state *transferState) (int64, error) {
 	timer := time.NewTimer(transferResumeTimeout)
 	defer timer.Stop()
 	select {
 	case offset := <-state.resumeCh:
 		return offset, nil
+	case <-state.cancelCh:
+		return 0, errTransferCanceled
 	case <-timer.C:
 		return 0, errors.New("timed out waiting for agent resume offset")
 	}
@@ -299,7 +362,13 @@ func (s *Service) handleTransferStart(msg protocol.FileTransferStart) {
 		}
 	}
 	if fail == nil {
-		state.Status = "running"
+		// Keep cancel_requested if the operator already pulled the plug:
+		// this ack only initializes the receiver, it must not resurrect a
+		// canceled transfer as running (the agent's confirmation or the
+		// reaper owns the terminal state now).
+		if state.Status != "cancel_requested" {
+			state.Status = "running"
+		}
 		state.Size = msg.Size
 		s.persistTransferLocked(state)
 	}
@@ -366,6 +435,13 @@ func (s *Service) handleTransferDone(msg protocol.FileTransferDone) {
 	}
 
 	state.mu.Lock()
+	if isTerminalTransferStatus(state.Status) {
+		// Late confirmation after a local terminal outcome (e.g. the pump
+		// already failed the transfer when the link dropped): keep the
+		// first terminal status — it is what the audit trail says happened.
+		state.mu.Unlock()
+		return
+	}
 	state.Status = msg.Status
 	state.Message = msg.Message
 	state.Size = msg.Size
@@ -447,7 +523,7 @@ func (s *Service) finishDownload(state *transferState, msg protocol.FileTransfer
 
 func (s *Service) finishTransferWithError(state *transferState, err error) {
 	state.mu.Lock()
-	if state.Status == "success" || state.Status == "failed" {
+	if isTerminalTransferStatus(state.Status) {
 		state.mu.Unlock()
 		return
 	}
@@ -467,7 +543,7 @@ func (s *Service) finishTransferWithError(state *transferState, err error) {
 // if the transfer was reaped by this call.
 func (s *Service) reapStalledTransfer(state *transferState, now time.Time) bool {
 	state.mu.Lock()
-	if state.Status == "success" || state.Status == "failed" {
+	if isTerminalTransferStatus(state.Status) {
 		state.mu.Unlock()
 		return false
 	}
@@ -611,4 +687,143 @@ func (s *Service) shouldPersistTransferProgressLocked(state *transferState, now 
 		return true
 	}
 	return now.Sub(state.lastPersistedAt) >= transferAuditMinInterval
+}
+
+// cancelTransfer requests cancellation of a live transfer (or reports the
+// status of an already-finalized one). The request is persisted as
+// cancel_requested BEFORE the signal is sent — the operator's intent is
+// auditable even if the agent never acknowledges. The transfer reaches
+// terminal "canceled" either via the agent's FileTransferDone{canceled}
+// confirmation or, for agents that never acknowledge (offline, or old
+// agents without cancel support), via the reaper after the grace window.
+//
+// Returns (snapshot, state, cancelSent, found). Canceling a terminal
+// transfer is idempotent: its terminal status is reported with sent=false.
+func (s *Service) cancelTransfer(transferID string) (TransferStatus, string, bool, bool) {
+	state, ok := s.getTransfer(transferID)
+	if !ok {
+		// Not live; a finalized audit record still answers the request.
+		if audit, found, err := s.store.TransferAudit(transferID); err == nil && found {
+			return TransferStatus{
+				ID:               audit.TransferID,
+				AgentID:          audit.AgentID,
+				Direction:        audit.Direction,
+				LocalPath:        audit.LocalPath,
+				RemotePath:       audit.RemotePath,
+				Status:           audit.Status,
+				Message:          audit.Message,
+				Size:             audit.Size,
+				BytesTransferred: audit.BytesTransferred,
+				ChecksumSHA256:   audit.ChecksumSHA256,
+				ChecksumVerified: audit.ChecksumVerified,
+				CreatedAt:        audit.CreatedAt,
+				CompletedAt:      audit.CompletedAt,
+			}, audit.Status, false, true
+		}
+		return TransferStatus{}, "", false, false
+	}
+
+	state.mu.Lock()
+	if isTerminalTransferStatus(state.Status) {
+		snap := state.snapshotLocked()
+		state.mu.Unlock()
+		return snap, snap.Status, false, true
+	}
+	firstRequest := state.Status != "cancel_requested"
+	if firstRequest {
+		state.Status = "cancel_requested"
+		state.Message = "cancellation requested"
+		state.cancelRequestedAt = time.Now().UTC()
+		s.persistTransferLocked(state)
+	}
+	// Release the upload pump (if this is a server->agent push) regardless
+	// of whether the agent turn-up was online: the pump owns the local .part
+	// on the server side and must stop touching it.
+	state.signalCancel()
+	snap := state.snapshotLocked()
+	agentID := state.AgentID
+	state.mu.Unlock()
+
+	if firstRequest {
+		s.logger.Info("transfer cancel requested",
+			zap.String("transfer_id", transferID), zap.String("agent_id", agentID))
+	} else {
+		s.logger.Info("transfer cancel re-signal",
+			zap.String("transfer_id", transferID), zap.String("agent_id", agentID))
+	}
+
+	// Re-issued requests re-send the signal (same contract as task cancel:
+	// asking again means "try telling the agent again"), so a repeat POST
+	// after a lost frame can still land the terminal confirmation early
+	// instead of waiting out the reaper grace.
+	sent := false
+	if client, err := s.clientForAgent(agentID); err == nil {
+		if err := client.sendMessage(protocol.TypeFileTransferCancel, protocol.FileTransferCancel{
+			TransferID:  transferID,
+			AgentID:     agentID,
+			RequestedAt: time.Now().UTC(),
+		}); err == nil {
+			sent = true
+		}
+	}
+	return snap, snap.Status, sent, true
+}
+
+// signalCancel releases any watcher blocked/selecting on cancelCh.
+// Idempotent and lock-free: safe to call while holding state.mu (close on
+// an uncontended channel never blocks). A nil cancelCh (hand-built test
+// state) is a no-op.
+func (t *transferState) signalCancel() {
+	if t.cancelCh == nil {
+		return
+	}
+	t.cancelOnce.Do(func() { close(t.cancelCh) })
+}
+
+// finalizeCanceled moves a live transfer to terminal "canceled", persists the
+// audit row, fires the plugin hook and drops it from the live map. The
+// partial (.part) file stays on both ends so a retry can resume. Safe to
+// call concurrently: the terminal guard under the state lock makes all but
+// one racing caller a no-op.
+func (s *Service) finalizeCanceled(state *transferState, message string) {
+	state.mu.Lock()
+	if isTerminalTransferStatus(state.Status) {
+		state.mu.Unlock()
+		return
+	}
+	state.Status = "canceled"
+	state.Message = message
+	state.CompletedAt = time.Now().UTC()
+	s.cleanupTransferFilesLocked(state, false)
+	snap := state.snapshotLocked()
+	s.persistTransferLocked(state)
+	state.mu.Unlock()
+	s.plugins.Trigger("transfer_done", snap)
+	s.deleteTransfer(state.ID)
+}
+
+// reapCanceledTransfers finalizes cancel_requested transfers whose agent has
+// not confirmed within the grace window, so a cancel against a dead
+// connection can never dangle in a non-terminal state forever.
+func (s *Service) reapCanceledTransfers(now time.Time) int {
+	s.transferMu.RLock()
+	states := make([]*transferState, 0, len(s.transfers))
+	for _, state := range s.transfers {
+		states = append(states, state)
+	}
+	s.transferMu.RUnlock()
+
+	reaped := 0
+	for _, state := range states {
+		state.mu.Lock()
+		due := state.Status == "cancel_requested" &&
+			!state.cancelRequestedAt.IsZero() &&
+			now.Sub(state.cancelRequestedAt) >= transferCancelGrace
+		state.mu.Unlock()
+		if due {
+			s.finalizeCanceled(state, "canceled: agent did not confirm within grace")
+			reaped++
+		}
+	}
+	return reaped
 }

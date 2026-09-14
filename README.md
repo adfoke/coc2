@@ -37,6 +37,7 @@ make build                                    # 产出 bin/{server,agent,coc2}
 - 上传 / 下载，分块 + SHA256 校验 + `Seq` 乱序重排与缺包检测
 - 断点续传：失败保留 `.part`，重试自动续传；10 分钟无进展自动回收
 - 全程审计（谁、何时、传到哪、完整性是否验证）
+- 传输可取消：`coc2 transfers cancel <id> [--wait]`；两端停泵、`.part` 保留可续传；取消意图（`cancel_requested`）与终态（`canceled`）都写审计，agent 失联时 30s 宽限期后服务端单方面落终态
 
 **连接与协议**
 - Agent 主动拨出 WebSocket，指数退避重连；心跳维护在线状态

@@ -37,6 +37,9 @@ func (s *Service) reapLoop() {
 			if n := s.reapStalledTransfers(now); n > 0 {
 				s.logger.Info("reaped stalled transfers", zap.Int("count", n))
 			}
+			if n := s.reapCanceledTransfers(now); n > 0 {
+				s.logger.Info("finalized unconfirmed transfer cancels", zap.Int("count", n))
+			}
 			if lastPrune.IsZero() || now.Sub(lastPrune) >= pruneInterval {
 				lastPrune = now
 				s.pruneAuditsIfNeeded(now)

@@ -980,12 +980,76 @@ func (x *FileTransferResume) GetOffset() int64 {
 	return 0
 }
 
+// FileTransferCancel asks the peer to stop an in-flight transfer. The
+// receiver confirms by completing the transfer with
+// FileTransferDone{status: "canceled"}; the partial (.part) file is kept
+// on both ends so a retry can resume.
+type FileTransferCancel struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	TransferId    string                 `protobuf:"bytes,1,opt,name=transfer_id,json=transferId,proto3" json:"transfer_id,omitempty"`
+	AgentId       string                 `protobuf:"bytes,2,opt,name=agent_id,json=agentId,proto3" json:"agent_id,omitempty"`
+	RequestedAt   *timestamppb.Timestamp `protobuf:"bytes,3,opt,name=requested_at,json=requestedAt,proto3" json:"requested_at,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *FileTransferCancel) Reset() {
+	*x = FileTransferCancel{}
+	mi := &file_coc2_v1_wire_proto_msgTypes[12]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *FileTransferCancel) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*FileTransferCancel) ProtoMessage() {}
+
+func (x *FileTransferCancel) ProtoReflect() protoreflect.Message {
+	mi := &file_coc2_v1_wire_proto_msgTypes[12]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use FileTransferCancel.ProtoReflect.Descriptor instead.
+func (*FileTransferCancel) Descriptor() ([]byte, []int) {
+	return file_coc2_v1_wire_proto_rawDescGZIP(), []int{12}
+}
+
+func (x *FileTransferCancel) GetTransferId() string {
+	if x != nil {
+		return x.TransferId
+	}
+	return ""
+}
+
+func (x *FileTransferCancel) GetAgentId() string {
+	if x != nil {
+		return x.AgentId
+	}
+	return ""
+}
+
+func (x *FileTransferCancel) GetRequestedAt() *timestamppb.Timestamp {
+	if x != nil {
+		return x.RequestedAt
+	}
+	return nil
+}
+
 type FileTransferDone struct {
 	state      protoimpl.MessageState `protogen:"open.v1"`
 	TransferId string                 `protobuf:"bytes,1,opt,name=transfer_id,json=transferId,proto3" json:"transfer_id,omitempty"`
 	AgentId    string                 `protobuf:"bytes,2,opt,name=agent_id,json=agentId,proto3" json:"agent_id,omitempty"`
 	Direction  string                 `protobuf:"bytes,3,opt,name=direction,proto3" json:"direction,omitempty"`
-	// status: "complete" or "failed".
+	// status: "complete", "failed", or "canceled".
 	Status         string                 `protobuf:"bytes,4,opt,name=status,proto3" json:"status,omitempty"`
 	Message        string                 `protobuf:"bytes,5,opt,name=message,proto3" json:"message,omitempty"`
 	Size           int64                  `protobuf:"varint,6,opt,name=size,proto3" json:"size,omitempty"`
@@ -997,7 +1061,7 @@ type FileTransferDone struct {
 
 func (x *FileTransferDone) Reset() {
 	*x = FileTransferDone{}
-	mi := &file_coc2_v1_wire_proto_msgTypes[12]
+	mi := &file_coc2_v1_wire_proto_msgTypes[13]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1009,7 +1073,7 @@ func (x *FileTransferDone) String() string {
 func (*FileTransferDone) ProtoMessage() {}
 
 func (x *FileTransferDone) ProtoReflect() protoreflect.Message {
-	mi := &file_coc2_v1_wire_proto_msgTypes[12]
+	mi := &file_coc2_v1_wire_proto_msgTypes[13]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1022,7 +1086,7 @@ func (x *FileTransferDone) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use FileTransferDone.ProtoReflect.Descriptor instead.
 func (*FileTransferDone) Descriptor() ([]byte, []int) {
-	return file_coc2_v1_wire_proto_rawDescGZIP(), []int{12}
+	return file_coc2_v1_wire_proto_rawDescGZIP(), []int{13}
 }
 
 func (x *FileTransferDone) GetTransferId() string {
@@ -1091,7 +1155,7 @@ type ErrorMessage struct {
 
 func (x *ErrorMessage) Reset() {
 	*x = ErrorMessage{}
-	mi := &file_coc2_v1_wire_proto_msgTypes[13]
+	mi := &file_coc2_v1_wire_proto_msgTypes[14]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1103,7 +1167,7 @@ func (x *ErrorMessage) String() string {
 func (*ErrorMessage) ProtoMessage() {}
 
 func (x *ErrorMessage) ProtoReflect() protoreflect.Message {
-	mi := &file_coc2_v1_wire_proto_msgTypes[13]
+	mi := &file_coc2_v1_wire_proto_msgTypes[14]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1116,7 +1180,7 @@ func (x *ErrorMessage) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ErrorMessage.ProtoReflect.Descriptor instead.
 func (*ErrorMessage) Descriptor() ([]byte, []int) {
-	return file_coc2_v1_wire_proto_rawDescGZIP(), []int{13}
+	return file_coc2_v1_wire_proto_rawDescGZIP(), []int{14}
 }
 
 func (x *ErrorMessage) GetCode() string {
@@ -1230,7 +1294,12 @@ const file_coc2_v1_wire_proto_rawDesc = "" +
 	"\vtransfer_id\x18\x01 \x01(\tR\n" +
 	"transferId\x12\x19\n" +
 	"\bagent_id\x18\x02 \x01(\tR\aagentId\x12\x16\n" +
-	"\x06offset\x18\x03 \x01(\x03R\x06offset\"\x9a\x02\n" +
+	"\x06offset\x18\x03 \x01(\x03R\x06offset\"\x8f\x01\n" +
+	"\x12FileTransferCancel\x12\x1f\n" +
+	"\vtransfer_id\x18\x01 \x01(\tR\n" +
+	"transferId\x12\x19\n" +
+	"\bagent_id\x18\x02 \x01(\tR\aagentId\x12=\n" +
+	"\frequested_at\x18\x03 \x01(\v2\x1a.google.protobuf.TimestampR\vrequestedAt\"\x9a\x02\n" +
 	"\x10FileTransferDone\x12\x1f\n" +
 	"\vtransfer_id\x18\x01 \x01(\tR\n" +
 	"transferId\x12\x19\n" +
@@ -1257,7 +1326,7 @@ func file_coc2_v1_wire_proto_rawDescGZIP() []byte {
 	return file_coc2_v1_wire_proto_rawDescData
 }
 
-var file_coc2_v1_wire_proto_msgTypes = make([]protoimpl.MessageInfo, 14)
+var file_coc2_v1_wire_proto_msgTypes = make([]protoimpl.MessageInfo, 15)
 var file_coc2_v1_wire_proto_goTypes = []any{
 	(*WireEnvelope)(nil),          // 0: coc2.v1.WireEnvelope
 	(*AgentHello)(nil),            // 1: coc2.v1.AgentHello
@@ -1271,27 +1340,29 @@ var file_coc2_v1_wire_proto_goTypes = []any{
 	(*FileTransferStart)(nil),     // 9: coc2.v1.FileTransferStart
 	(*FileTransferChunk)(nil),     // 10: coc2.v1.FileTransferChunk
 	(*FileTransferResume)(nil),    // 11: coc2.v1.FileTransferResume
-	(*FileTransferDone)(nil),      // 12: coc2.v1.FileTransferDone
-	(*ErrorMessage)(nil),          // 13: coc2.v1.ErrorMessage
-	(*timestamppb.Timestamp)(nil), // 14: google.protobuf.Timestamp
+	(*FileTransferCancel)(nil),    // 12: coc2.v1.FileTransferCancel
+	(*FileTransferDone)(nil),      // 13: coc2.v1.FileTransferDone
+	(*ErrorMessage)(nil),          // 14: coc2.v1.ErrorMessage
+	(*timestamppb.Timestamp)(nil), // 15: google.protobuf.Timestamp
 }
 var file_coc2_v1_wire_proto_depIdxs = []int32{
-	14, // 0: coc2.v1.AgentHello.connected_at:type_name -> google.protobuf.Timestamp
-	14, // 1: coc2.v1.HelloAck.server_time:type_name -> google.protobuf.Timestamp
+	15, // 0: coc2.v1.AgentHello.connected_at:type_name -> google.protobuf.Timestamp
+	15, // 1: coc2.v1.HelloAck.server_time:type_name -> google.protobuf.Timestamp
 	5,  // 2: coc2.v1.HelloAck.pending_tasks:type_name -> coc2.v1.Task
-	14, // 3: coc2.v1.Heartbeat.timestamp:type_name -> google.protobuf.Timestamp
-	14, // 4: coc2.v1.MetricsReport.timestamp:type_name -> google.protobuf.Timestamp
-	14, // 5: coc2.v1.Task.created_at:type_name -> google.protobuf.Timestamp
-	14, // 6: coc2.v1.TaskAck.received_at:type_name -> google.protobuf.Timestamp
-	14, // 7: coc2.v1.TaskCancel.requested_at:type_name -> google.protobuf.Timestamp
-	14, // 8: coc2.v1.TaskResult.completed_at:type_name -> google.protobuf.Timestamp
-	14, // 9: coc2.v1.FileTransferStart.requested_at:type_name -> google.protobuf.Timestamp
-	14, // 10: coc2.v1.FileTransferDone.completed_at:type_name -> google.protobuf.Timestamp
-	11, // [11:11] is the sub-list for method output_type
-	11, // [11:11] is the sub-list for method input_type
-	11, // [11:11] is the sub-list for extension type_name
-	11, // [11:11] is the sub-list for extension extendee
-	0,  // [0:11] is the sub-list for field type_name
+	15, // 3: coc2.v1.Heartbeat.timestamp:type_name -> google.protobuf.Timestamp
+	15, // 4: coc2.v1.MetricsReport.timestamp:type_name -> google.protobuf.Timestamp
+	15, // 5: coc2.v1.Task.created_at:type_name -> google.protobuf.Timestamp
+	15, // 6: coc2.v1.TaskAck.received_at:type_name -> google.protobuf.Timestamp
+	15, // 7: coc2.v1.TaskCancel.requested_at:type_name -> google.protobuf.Timestamp
+	15, // 8: coc2.v1.TaskResult.completed_at:type_name -> google.protobuf.Timestamp
+	15, // 9: coc2.v1.FileTransferStart.requested_at:type_name -> google.protobuf.Timestamp
+	15, // 10: coc2.v1.FileTransferCancel.requested_at:type_name -> google.protobuf.Timestamp
+	15, // 11: coc2.v1.FileTransferDone.completed_at:type_name -> google.protobuf.Timestamp
+	12, // [12:12] is the sub-list for method output_type
+	12, // [12:12] is the sub-list for method input_type
+	12, // [12:12] is the sub-list for extension type_name
+	12, // [12:12] is the sub-list for extension extendee
+	0,  // [0:12] is the sub-list for field type_name
 }
 
 func init() { file_coc2_v1_wire_proto_init() }
@@ -1305,7 +1376,7 @@ func file_coc2_v1_wire_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_coc2_v1_wire_proto_rawDesc), len(file_coc2_v1_wire_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   14,
+			NumMessages:   15,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

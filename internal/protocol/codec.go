@@ -263,6 +263,17 @@ func codecFor(msgType string) (toProto func(any) (proto.Message, error), fromPro
 				}
 				return FileTransferResume{TransferID: m.TransferId, AgentID: m.AgentId, Offset: m.Offset}, nil
 			}, true
+	case TypeFileTransferCancel:
+		return func(v any) (proto.Message, error) {
+				m := v.(FileTransferCancel)
+				return &pb.FileTransferCancel{TransferId: m.TransferID, AgentId: m.AgentID, RequestedAt: toProtoTime(m.RequestedAt)}, nil
+			}, func(pm proto.Message) (any, error) {
+				m, ok := pm.(*pb.FileTransferCancel)
+				if !ok {
+					return nil, errType(msgType, pm)
+				}
+				return FileTransferCancel{TransferID: m.TransferId, AgentID: m.AgentId, RequestedAt: fromProtoTime(m.RequestedAt)}, nil
+			}, true
 	case TypeFileTransferDone:
 		return func(v any) (proto.Message, error) {
 				m := v.(FileTransferDone)
@@ -326,6 +337,8 @@ func newProtoMessage(msgType string) (proto.Message, bool) {
 		return &pb.FileTransferChunk{}, true
 	case TypeFileTransferResume:
 		return &pb.FileTransferResume{}, true
+	case TypeFileTransferCancel:
+		return &pb.FileTransferCancel{}, true
 	case TypeFileTransferDone:
 		return &pb.FileTransferDone{}, true
 	case TypeError:

@@ -126,11 +126,21 @@ message FileTransferResume {
   int64 offset = 3;
 }
 
+// FileTransferCancel asks the peer to stop an in-flight transfer. The
+// receiver confirms by completing the transfer with
+// FileTransferDone{status: "canceled"}; the partial (.part) file is kept
+// on both ends so a retry can resume.
+message FileTransferCancel {
+  string transfer_id = 1;
+  string agent_id = 2;
+  google.protobuf.Timestamp requested_at = 3;
+}
+
 message FileTransferDone {
   string transfer_id = 1;
   string agent_id = 2;
   string direction = 3;
-  // status: "complete" or "failed".
+  // status: "complete", "failed", or "canceled".
   string status = 4;
   string message = 5;
   int64 size = 6;

@@ -599,6 +599,21 @@ func (s *Service) operatorRoutes() *gin.Engine {
 		c.JSON(http.StatusOK, transfers)
 	})
 
+	engine.POST("/api/v1/transfers/:id/cancel", func(c *gin.Context) {
+		snap, state, cancelSent, found := s.cancelTransfer(c.Param("id"))
+		if !found {
+			c.JSON(http.StatusNotFound, gin.H{"error": "transfer not found"})
+			return
+		}
+		c.JSON(http.StatusAccepted, gin.H{
+			"transfer_id": snap.ID,
+			"agent_id":    snap.AgentID,
+			"direction":   snap.Direction,
+			"status":      state,
+			"cancel_sent": cancelSent,
+		})
+	})
+
 	engine.GET("/api/v1/oplog", func(c *gin.Context) {
 		since, until, err := parseTimeRange(c)
 		if err != nil {

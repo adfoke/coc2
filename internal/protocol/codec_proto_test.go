@@ -58,6 +58,7 @@ func roundTripSamples() []struct {
 		{TypeFileTransferChunk, FileTransferChunk{TransferID: "x1", Seq: 7, Data: []byte{0, 1, 2, 0xff, 0xfe}}},
 		{TypeFileTransferChunk, FileTransferChunk{TransferID: "x1", Seq: 0, Data: []byte{}}},
 		{TypeFileTransferResume, FileTransferResume{TransferID: "x1", AgentID: "a1", Offset: 1 << 33}},
+		{TypeFileTransferCancel, FileTransferCancel{TransferID: "x1", AgentID: "a1", RequestedAt: ts}},
 		{TypeFileTransferDone, FileTransferDone{
 			TransferID: "x1", AgentID: "a1", Direction: "download", Status: "complete",
 			Message: "ok", Size: 999, ChecksumSHA256: "def", CompletedAt: ts,
@@ -119,6 +120,10 @@ func decodeJSONRoundTrip(t *testing.T, msgType string, payload any) any {
 		return v
 	case FileTransferResume:
 		v, err := UnmarshalPayload[FileTransferResume](env)
+		must(t, err)
+		return v
+	case FileTransferCancel:
+		v, err := UnmarshalPayload[FileTransferCancel](env)
 		must(t, err)
 		return v
 	case FileTransferDone:
@@ -243,6 +248,11 @@ func assertEqualDecoded(t *testing.T, msgType string, orig, viaJSON, viaProto an
 	case FileTransferResume:
 		got := viaProto.(FileTransferResume)
 		if got != want {
+			t.Fatalf("%s mismatch: json=%+v proto=%+v", msgType, want, got)
+		}
+	case FileTransferCancel:
+		got := viaProto.(FileTransferCancel)
+		if got.TransferID != want.TransferID || got.AgentID != want.AgentID || !timePtrEqual(got.RequestedAt, want.RequestedAt) {
 			t.Fatalf("%s mismatch: json=%+v proto=%+v", msgType, want, got)
 		}
 	case FileTransferDone:

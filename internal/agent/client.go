@@ -45,13 +45,17 @@ type Client struct {
 	// binaryOut flips once hello_ack arrives as a binary frame, proving the
 	// server completed the protobuf negotiation; every message after it is
 	// sent protobuf-encoded. Reads always accept both framings by opcode.
-	binaryOut atomic.Bool
-	taskMu    sync.Mutex
-	running   map[string]context.CancelFunc
-	resultMu  sync.Mutex
-	results   map[string]cachedTaskResult
-	uploadMu  sync.Mutex
-	uploads   map[string]*uploadState
+	binaryOut  atomic.Bool
+	taskMu     sync.Mutex
+	running    map[string]context.CancelFunc
+	resultMu   sync.Mutex
+	results    map[string]cachedTaskResult
+	uploadMu   sync.Mutex
+	uploads    map[string]*uploadState
+	downloadMu sync.Mutex
+	// downloads holds the cancel func of every in-flight sendFile pump so a
+	// server-initiated file_transfer_cancel can stop an agent->server push.
+	downloads map[string]context.CancelFunc
 }
 
 type cachedTaskResult struct {
@@ -119,9 +123,10 @@ func New(cfg Config, logger *zap.Logger) (*Client, error) {
 			HandshakeTimeout: 10 * time.Second,
 			TLSClientConfig:  tlsCfg,
 		},
-		running: make(map[string]context.CancelFunc),
-		results: make(map[string]cachedTaskResult),
-		uploads: make(map[string]*uploadState),
+		running:   make(map[string]context.CancelFunc),
+		results:   make(map[string]cachedTaskResult),
+		uploads:   make(map[string]*uploadState),
+		downloads: make(map[string]context.CancelFunc),
 	}, nil
 }
 
@@ -249,6 +254,12 @@ func (c *Client) runOnce(ctx context.Context) error {
 				return err
 			}
 			c.handleTransferChunk(conn, chunk)
+		case protocol.TypeFileTransferCancel:
+			cancelMsg, err := protocol.PayloadOf[protocol.FileTransferCancel](in)
+			if err != nil {
+				return err
+			}
+			c.handleTransferCancel(conn, cancelMsg)
 		case protocol.TypeFileTransferDone:
 			done, err := protocol.PayloadOf[protocol.FileTransferDone](in)
 			if err != nil {
@@ -444,12 +455,63 @@ func (c *Client) ackTask(conn *websocket.Conn, taskID string) error {
 	})
 }
 
-func (c *Client) handleTransferStart(_ context.Context, conn *websocket.Conn, start protocol.FileTransferStart) {
+func (c *Client) handleTransferStart(ctx context.Context, conn *websocket.Conn, start protocol.FileTransferStart) {
 	switch start.Direction {
 	case "upload":
 		c.beginUpload(conn, start)
 	case "download":
-		go c.sendFile(conn, start)
+		// The pump runs on its own goroutine (so the readLoop stays free
+		// to process a file_transfer_cancel); register a cancel func for
+		// it under the session context.
+		dctx, cancel := context.WithCancel(ctx)
+		c.downloadMu.Lock()
+		c.downloads[start.TransferID] = cancel
+		c.downloadMu.Unlock()
+		go c.sendFile(dctx, conn, start)
+	}
+}
+
+// handleTransferCancel stops an in-flight transfer at the operator's
+// request and confirms with FileTransferDone{canceled} — the server keeps
+// the authoritative audit row.
+//
+// Both directions converge here: an agent->server push is running in
+// sendFile's goroutine (cancelled via its registered cancel func; the pump
+// sends the confirmation itself); a server->agent upload is buffered in
+// uploads and is aborted synchronously, keeping the .part so a retry can
+// resume. Unknown ids are ignored: the transfer already reached a terminal
+// state and the server has the outcome.
+func (c *Client) handleTransferCancel(conn *websocket.Conn, msg protocol.FileTransferCancel) {
+	c.uploadMu.Lock()
+	up := c.uploads[msg.TransferID]
+	if up != nil {
+		delete(c.uploads, msg.TransferID)
+	}
+	c.uploadMu.Unlock()
+
+	if up != nil {
+		if up.file != nil {
+			_ = up.file.Close()
+		}
+		c.sendTransferDone(conn, protocol.FileTransferDone{
+			TransferID:  msg.TransferID,
+			AgentID:     c.agentID,
+			Direction:   "upload",
+			Status:      "canceled",
+			Message:     "canceled by operator",
+			Size:        up.received,
+			CompletedAt: time.Now().UTC(),
+		})
+		return
+	}
+
+	c.downloadMu.Lock()
+	cancel := c.downloads[msg.TransferID]
+	c.downloadMu.Unlock()
+	if cancel != nil {
+		// The sendFile pump observes the closed ctx at its next chunk
+		// boundary, sends the canceled done, and deregisters itself.
+		cancel()
 	}
 }
 
@@ -577,7 +639,15 @@ func (c *Client) handleTransferDone(conn *websocket.Conn, done protocol.FileTran
 	c.sendTransferDone(conn, c.finalizeUpload(state, done))
 }
 
-func (c *Client) sendFile(conn *websocket.Conn, start protocol.FileTransferStart) {
+func (c *Client) sendFile(ctx context.Context, conn *websocket.Conn, start protocol.FileTransferStart) {
+	defer func() {
+		c.downloadMu.Lock()
+		if c.downloads[start.TransferID] != nil {
+			delete(c.downloads, start.TransferID)
+		}
+		c.downloadMu.Unlock()
+	}()
+
 	file, err := os.Open(start.RemotePath)
 	if err != nil {
 		c.sendTransferDone(conn, protocol.FileTransferDone{
@@ -659,6 +729,25 @@ func (c *Client) sendFile(conn *websocket.Conn, start protocol.FileTransferStart
 	seq := int(offset / int64(chunkSize))
 	transferred := offset
 	for {
+		select {
+		case <-ctx.Done():
+			// Operator cancel (handleTransferCancel closed our ctx): stop
+			// sending and confirm — the server flips the audit row to a
+			// terminal "canceled". The partial on the server side stays, so
+			// a retry resumes from its offset.
+			c.sendTransferDone(conn, protocol.FileTransferDone{
+				TransferID:     start.TransferID,
+				AgentID:        c.agentID,
+				Direction:      start.Direction,
+				Status:         "canceled",
+				Message:        "canceled by operator",
+				Size:           transferred,
+				ChecksumSHA256: checksum,
+				CompletedAt:    time.Now().UTC(),
+			})
+			return
+		default:
+		}
 		n, readErr := file.Read(buf)
 		if n > 0 {
 			if err := c.send(conn, protocol.TypeFileTransferChunk, protocol.FileTransferChunk{

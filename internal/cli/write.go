@@ -26,7 +26,14 @@ func taskTerminal(state string) bool {
 }
 
 func transferTerminal(status string) bool {
-	return status == taskSuccess || status == taskFailed
+	// "cancel_requested" is NOT terminal: the transfer flips to "canceled"
+	// once the agent confirms (or the reaper finalizes it), and --wait
+	// should surface that outcome rather than stop early.
+	switch status {
+	case taskSuccess, taskFailed, taskCanceled:
+		return true
+	}
+	return false
 }
 
 // poll fetches path every backoff tick until accept returns ok=true or the
@@ -316,4 +323,41 @@ func addWriteCommands(r *Registry) {
 	}
 	addTransfer("push", "Send a file from the server host to an agent", "/api/v1/files/upload")
 	addTransfer("pull", "Fetch a file from an agent to the server host", "/api/v1/files/download")
+
+	r.Add(&Command{
+		Name:    "transfers cancel",
+		Summary: "Request cancellation of an in-flight transfer (partial files are kept for resume)",
+		Params:  []string{"transfer_id"},
+		Flags: []FlagSpec{
+			{Name: "wait", Type: "bool", Desc: "block until the transfer reaches a terminal state (agent confirm or reaper grace)"},
+			{Name: "wait-timeout", Type: "duration", Default: "90s", Desc: "poll budget for --wait; must cover the 30s confirm grace"},
+		},
+		Run: func(g *Globals, cf *CmdFlags) error {
+			if err := mustArgs(cf, 1, "transfers cancel <transfer_id>"); err != nil {
+				return err
+			}
+			id := url.PathEscape(cf.Args()[0])
+			var out map[string]any
+			if err := g.Client.Post("/api/v1/transfers/"+id+"/cancel", nil, &out); err != nil {
+				return err
+			}
+			if !cf.Bool("wait") {
+				return Emit(g.Stdout, out, g.Pretty)
+			}
+			// The POST answered cancel_requested (or a terminal status if it
+			// already finished). Wait for the real terminal outcome.
+			final, err := poll[map[string]any](g, "/api/v1/transfers/"+id, cf.Duration("wait-timeout"),
+				func(m map[string]any) bool { s, _ := m["status"].(string); return transferTerminal(s) })
+			if err != nil {
+				return err
+			}
+			if err := Emit(g.Stdout, final, g.Pretty); err != nil {
+				return err
+			}
+			if s, _ := final["status"].(string); s != taskCanceled {
+				return fail("transfer_not_canceled", fmt.Sprintf("transfer ended as %s", s), ExitFailure)
+			}
+			return nil
+		},
+	})
 }
