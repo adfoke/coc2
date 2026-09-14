@@ -46,6 +46,8 @@ func loadServerConfig(args []string) (server.Config, error) {
 	writeWait := cfg.WriteWait
 	pongWait := cfg.PongWait
 	pingPeriod := cfg.PingPeriod
+	logFile := cfg.LogFile
+	logLevel := cfg.LogLevel
 
 	fs.StringVar(&configPath, "config", configPath, "server config yaml path")
 	fs.StringVar(&listen, "listen", listen, "agent plane listen address")
@@ -62,6 +64,8 @@ func loadServerConfig(args []string) (server.Config, error) {
 	fs.DurationVar(&writeWait, "write-wait", writeWait, "websocket write timeout")
 	fs.DurationVar(&pongWait, "pong-wait", pongWait, "heartbeat timeout")
 	fs.DurationVar(&pingPeriod, "ping-period", pingPeriod, "websocket ping interval")
+	fs.StringVar(&logFile, "log-file", logFile, "log to this file with size rotation (default: stderr)")
+	fs.StringVar(&logLevel, "log-level", logLevel, "debug|info|warn|error")
 
 	if err := fs.Parse(args); err != nil {
 		return server.Config{}, err
@@ -117,6 +121,12 @@ func loadServerConfig(args []string) (server.Config, error) {
 	}
 	if visited["ping-period"] {
 		cfg.PingPeriod = pingPeriod
+	}
+	if visited["log-file"] {
+		cfg.LogFile = logFile
+	}
+	if visited["log-level"] {
+		cfg.LogLevel = logLevel
 	}
 
 	return cfg, nil

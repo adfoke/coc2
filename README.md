@@ -47,6 +47,7 @@ make build                                    # 产出 bin/{server,agent,coc2}
 - SQLite 持久化（Agent、任务、分组、指标、传输审计、操作日志）
 - 操作审计（`oplog`）：每条写操作记录谁（UDS 内核凭据 uid→用户名 / TCP token 身份）、从哪（peer pid / socket / IP）、做了什么、结果如何；认证失败同样落库；`coc2 audit list` 查询
 - 基础监控上报 + 指标历史（每 Agent 最近 1000 条）
+- 运行日志可落盘并按大小轮转（`log_file` / `log_level` / `log_max_*`，默认 stderr）；审计历史保留可配（`audit_retention_days`，默认 0 = 永久保留，运维工具不擅自销毁证据）
 - 本地可执行文件插件钩子（[plugins/README.md](plugins/README.md)）
 - CLI：紧凑 JSON / 退出码契约 / 无交互 / `--wait` 阻塞收结果 / `schema` 自描述
 

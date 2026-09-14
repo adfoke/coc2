@@ -19,6 +19,10 @@ func (s *Service) reapLoop() {
 	ticker := time.NewTicker(taskReapInterval)
 	defer ticker.Stop()
 
+	// One retention pass at startup, then once a day on the same ticker.
+	lastPrune := time.Now().UTC()
+	s.pruneAuditsIfNeeded(lastPrune)
+
 	for {
 		select {
 		case <-s.reaperStop:
@@ -32,6 +36,10 @@ func (s *Service) reapLoop() {
 			}
 			if n := s.reapStalledTransfers(now); n > 0 {
 				s.logger.Info("reaped stalled transfers", zap.Int("count", n))
+			}
+			if lastPrune.IsZero() || now.Sub(lastPrune) >= pruneInterval {
+				lastPrune = now
+				s.pruneAuditsIfNeeded(now)
 			}
 		}
 	}

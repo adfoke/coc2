@@ -68,3 +68,48 @@ func TestLoadServerConfigWithoutYAMLUsesDefaults(t *testing.T) {
 		t.Fatalf("unexpected default paths: %+v", cfg)
 	}
 }
+
+func TestLoadServerConfigLoggingFields(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	raw := []byte("listen: \":9090\"\ntoken: t\nlog_file: ./var/log/coc2.log\nlog_level: warn\nlog_max_size_mb: 32\nlog_max_backups: 2\nlog_max_age_days: 7\nlog_compress: true\naudit_retention_days: 90\n")
+	if err := os.WriteFile(path, raw, 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := loadServerConfig([]string{"-config", path})
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if cfg.LogFile != "./var/log/coc2.log" || cfg.LogLevel != "warn" {
+		t.Fatalf("yaml logging not parsed: %+v", cfg)
+	}
+	if cfg.LogMaxSizeMB != 32 || cfg.LogMaxBackups != 2 || cfg.LogMaxAgeDays != 7 || !cfg.LogCompress {
+		t.Fatalf("yaml rotation knobs not parsed: %+v", cfg)
+	}
+	if cfg.AuditRetentionDays != 90 {
+		t.Fatalf("audit_retention_days = %d", cfg.AuditRetentionDays)
+	}
+
+	// CLI flag must win over YAML (same contract as every other field).
+	cfg, err = loadServerConfig([]string{"-config", path, "-log-file", "/tmp/other.log", "-log-level", "error"})
+	if err != nil {
+		t.Fatalf("load with flags: %v", err)
+	}
+	if cfg.LogFile != "/tmp/other.log" || cfg.LogLevel != "error" {
+		t.Fatalf("flag override failed: %+v", cfg)
+	}
+}
+
+func TestLoadServerConfigLoggingDefaultsOff(t *testing.T) {
+	cfg, err := loadServerConfig(nil)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if cfg.LogFile != "" {
+		t.Fatalf("default must log to stderr, got file %q", cfg.LogFile)
+	}
+	if cfg.AuditRetentionDays != 0 {
+		t.Fatalf("retention must default to off (0), got %d", cfg.AuditRetentionDays)
+	}
+}
