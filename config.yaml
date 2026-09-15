@@ -13,6 +13,12 @@ ping_period: "25s"
 operator_uds: "./coc2.sock"
 operator_listen: ""
 
+# Refuse to start while token is still the built-in development value above:
+# it is public knowledge, so anyone who can reach the agent plane could talk
+# to it. Replace token with `openssl rand -hex 32`, or set this to true for a
+# throwaway local run only.
+allow_dev_token: false
+
 # Runtime logs: empty log_file keeps stderr (a service manager captures it).
 # When set, logs go to the file with size-based rotation.
 log_file: ""
@@ -22,7 +28,6 @@ log_max_backups: 5       # rotated files kept
 log_max_age_days: 28     # rotated files older than this are removed
 log_compress: false
 
-# Audit retention for oplog / transfer_audit / task history.
-# 0 (default) keeps everything forever — evidence is only deleted when the
-# operator explicitly asks for it.
-audit_retention_days: 0
+# Audit retention for oplog / transfer_audit / task history. Default 14 days
+# (two weeks) when the key is absent. Set 0 to keep everything forever.
+audit_retention_days: 14

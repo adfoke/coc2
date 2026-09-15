@@ -423,15 +423,18 @@ func (s *Service) handleTransferChunk(msg protocol.FileTransferChunk) {
 	state.mu.Unlock()
 }
 
-func (s *Service) handleTransferDone(msg protocol.FileTransferDone) {
+// handleTransferDone applies an agent's transfer confirmation. It reports
+// whether the transfer was still live, so the caller can audit a confirmation
+// that matched nothing.
+func (s *Service) handleTransferDone(msg protocol.FileTransferDone) bool {
 	state, ok := s.getTransfer(msg.TransferID)
 	if !ok {
-		return
+		return false
 	}
 
 	if state.Direction == "download" {
 		s.finishDownload(state, msg)
-		return
+		return true
 	}
 
 	state.mu.Lock()
@@ -440,7 +443,7 @@ func (s *Service) handleTransferDone(msg protocol.FileTransferDone) {
 		// already failed the transfer when the link dropped): keep the
 		// first terminal status — it is what the audit trail says happened.
 		state.mu.Unlock()
-		return
+		return true
 	}
 	state.Status = msg.Status
 	state.Message = msg.Message
@@ -455,6 +458,7 @@ func (s *Service) handleTransferDone(msg protocol.FileTransferDone) {
 	s.persistTransferLocked(state)
 	state.mu.Unlock()
 	s.deleteTransfer(state.ID)
+	return true
 }
 
 // finalizeDownloadFailed records a failed download while the state lock is

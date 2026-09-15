@@ -260,7 +260,7 @@ func TestOplogAgentPlaneAuthFailure(t *testing.T) {
 }
 
 func TestOplogUDSPlaneRecordsUnixActor(t *testing.T) {
-	sock := filepath.Join(t.TempDir(), "op.sock")
+	sock := shortSockPath(t)
 	svc, err := New(Config{
 		ListenAddr:      ":0",
 		OperatorUDSPath: sock,

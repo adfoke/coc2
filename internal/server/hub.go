@@ -10,20 +10,20 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
+	"github.com/gin-gonic/gin"
+	"github.com/gorilla/websocket"
+	"go.uber.org/zap"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
-
-	"github.com/gin-gonic/gin"
-	"github.com/gorilla/websocket"
-	"go.uber.org/zap"
 
 	"coc2/internal/common"
 	"coc2/internal/protocol"
@@ -67,6 +67,18 @@ type agentConn struct {
 	done      chan struct{}
 	service   *Service
 	closeOnce sync.Once
+
+	// sendMu guards sendClosed so sendMessage never writes to a closed
+	// channel (which panics). closeOnce/done stay separate: a hard close
+	// must remain safe to trigger from any goroutine at any time.
+	sendMu     sync.Mutex
+	sendClosed bool
+
+	// drained is closed by writeLoop when it stops writing, letting a
+	// graceful close wait for queued frames (a rejection reason, a final
+	// task result) to reach the peer before the socket goes away.
+	drained  chan struct{}
+	closeRun sync.Once
 
 	// remoteAddr is the peer address of the underlying TCP connection,
 	// captured at upgrade time. The oplog uses it to attribute failed
@@ -682,6 +694,7 @@ func (s *Service) handleAgentWS(c *gin.Context) {
 		remoteAddr: c.Request.RemoteAddr,
 		send:       make(chan wsFrame, 16),
 		done:       make(chan struct{}),
+		drained:    make(chan struct{}),
 		service:    s,
 	}
 	go agent.writeLoop()
@@ -713,11 +726,16 @@ func (s *Service) register(client *agentConn, hello protocol.AgentHello) ([]prot
 	client.meta = hello
 
 	s.mu.Lock()
-	if old := s.clients[hello.AgentID]; old != nil && old != client {
-		old.close()
-	}
+	old := s.clients[hello.AgentID]
 	s.clients[hello.AgentID] = client
 	s.mu.Unlock()
+
+	// Retire the previous session outside the hub lock: a graceful close may
+	// wait for the queue to flush, and the hub must not stall behind a slow
+	// or malicious peer.
+	if old != nil && old != client {
+		old.drainThenClose()
+	}
 
 	if err := s.store.UpsertAgent(AgentState{
 		AgentID:     hello.AgentID,
@@ -744,7 +762,9 @@ func (s *Service) touch(agentID string) {
 
 func (s *Service) unregister(client *agentConn) {
 	if client.id == "" {
-		client.close()
+		// Unauthenticated peer: nothing is persisted, so it is enough to
+		// flush whatever we told it (a rejection reason) and hang up.
+		client.drainThenClose()
 		return
 	}
 
@@ -757,7 +777,7 @@ func (s *Service) unregister(client *agentConn) {
 	if err := s.store.SetAgentOnline(client.id, false, time.Now().UTC()); err != nil {
 		s.logger.Warn("set agent offline", zap.String("agent_id", client.id), zap.Error(err))
 	}
-	client.close()
+	client.drainThenClose()
 }
 
 func (s *Service) createTask(agentID, command string, timeoutSecs, priority int) (taskDispatchResponse, error) {
@@ -783,13 +803,32 @@ func (s *Service) createTask(agentID, command string, timeoutSecs, priority int)
 	}, nil
 }
 
+// agentIDPattern constrains target agent ids to a conservative charset:
+// non-empty, no whitespace or control characters, bounded length. Ids arrive
+// from an operator (agent_ids) or from an agent's own hello, and from there
+// they are used as map keys, database keys, and log fields — a blank or
+// control-laden id would create a queue nothing can ever claim or forge
+// confusing audit rows.
+var agentIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:@+-]{0,127}$`)
+
+func validAgentID(id string) bool {
+	return agentIDPattern.MatchString(id)
+}
+
 func (s *Service) resolveTargetAgentIDs(agentIDs, groupIDs, tags []string) ([]string, error) {
 	set := make(map[string]struct{})
 	for _, agentID := range agentIDs {
 		agentID = strings.TrimSpace(agentID)
-		if agentID != "" {
-			set[agentID] = struct{}{}
+		if agentID == "" {
+			// An empty id is not a wildcard and not a typo we can guess at;
+			// silently queuing work for "" (as before) created a task no
+			// agent could ever receive.
+			return nil, errors.New("agent_ids must not contain an empty entry")
 		}
+		if !validAgentID(agentID) {
+			return nil, fmt.Errorf("invalid agent id %q", truncateForLog(agentID, 64))
+		}
+		set[agentID] = struct{}{}
 	}
 
 	if len(groupIDs) > 0 {
@@ -798,6 +837,9 @@ func (s *Service) resolveTargetAgentIDs(agentIDs, groupIDs, tags []string) ([]st
 			return nil, err
 		}
 		for _, agentID := range groupAgentIDs {
+			if agentID == "" {
+				continue
+			}
 			set[agentID] = struct{}{}
 		}
 	}

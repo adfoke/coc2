@@ -270,6 +270,64 @@ func (s *Service) logAgentAuthFailure(remoteAddr, claimedAgentID string) {
 	})
 }
 
+// agentEvent says what an authenticated agent reported and what the server did
+// with it.
+type agentEvent struct {
+	Kind    string // connect | task_result | transfer_done | metrics_report
+	AgentID string
+	OK      bool
+	Status  int
+	Ref     string
+	Summary string
+	// About holds the agent ids the row concerns, so `coc2 audit list
+	// --agent X` finds agent-plane rows the same way it finds operator ones.
+	About []string
+}
+
+// logAgentEvent persists what an authenticated agent did on the agent plane.
+//
+// Until now only authentication *failures* were recorded, which left the
+// audit trail one-sided in the worst possible way: a genuine agent's work left
+// no trace, and neither did a forged result — so the two were
+// indistinguishable after the fact. Callers emit these from a goroutine
+// because a write op must never stall the agent read loop.
+func (s *Service) logAgentEvent(conn *agentConn, ev agentEvent) {
+	status := ev.Status
+	if status == 0 {
+		if ev.OK {
+			status = http.StatusOK
+		} else {
+			status = http.StatusBadRequest
+		}
+	}
+	agents := ev.About
+	if len(agents) == 0 && ev.AgentID != "" {
+		agents = []string{ev.AgentID}
+	}
+	s.appendOpLog(OpLogEntry{
+		RequestID:     common.NewID(),
+		TS:            time.Now().UTC(),
+		Plane:         "agent",
+		Actor:         ev.AgentID,
+		UID:           -1,
+		PID:           -1,
+		Source:        conn.remoteAddr,
+		Method:        "WEBSOCKET",
+		Path:          "/ws/agent",
+		Status:        status,
+		OK:            ev.OK,
+		Ref:           truncateForLog(ev.Ref, oplogMaxRefChars),
+		Agents:        agents,
+		ParamsSummary: truncateForLog(ev.Kind+" "+ev.Summary, oplogMaxSummaryChars),
+	})
+}
+
+// auditAgentEvent records an agent-plane event off the read path, so a slow
+// audit write can never stall the message loop.
+func (s *Service) auditAgentEvent(conn *agentConn, ev agentEvent) {
+	go s.logAgentEvent(conn, ev)
+}
+
 func (s *Service) appendOpLog(entry OpLogEntry) {
 	if err := s.store.AddOpLog(entry); err != nil {
 		s.logger.Warn("persist oplog",

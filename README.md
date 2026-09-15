@@ -13,11 +13,16 @@
 ```bash
 make build                                    # 产出 bin/{server,agent,coc2}
 
-./bin/server -config ./config.yaml            # Agent 面 :8080；Operator 面 ./coc2.sock
-./bin/agent -server ws://127.0.0.1:8080/ws/agent -token coc2-dev-token &
+# token 必须换掉：内置的 coc2-dev-token 是公开值，Server 会拒绝用它启动。
+export COC2_TOKEN=$(openssl rand -hex 32)
+
+./bin/server -config ./config.yaml -token "$COC2_TOKEN"          # Agent 面 :8080；Operator 面 ./coc2.sock
+./bin/agent -server ws://127.0.0.1:8080/ws/agent -token "$COC2_TOKEN" &
 
 ./bin/coc2 run --cmd "uptime" --agents <agent_id> --wait
 ```
+
+只想本地随手跑一次、不想配 token：加 `-allow-dev-token` 显式放行（不要用于任何真实环境）。
 
 输出即结果：
 
@@ -46,9 +51,9 @@ make build                                    # 产出 bin/{server,agent,coc2}
 
 **平台**
 - SQLite 持久化（Agent、任务、分组、指标、传输审计、操作日志）
-- 操作审计（`oplog`）：每条写操作记录谁（UDS 内核凭据 uid→用户名 / TCP token 身份）、从哪（peer pid / socket / IP）、做了什么、结果如何；认证失败同样落库；`coc2 audit list` 查询
+- 操作审计（`oplog`）：每条写操作记录谁（UDS 内核凭据 uid→用户名 / TCP token 身份）、从哪（peer pid / socket / IP）、做了什么、结果如何；认证失败同样落库。Agent 面不只记失败——已认证 agent 的连接、任务结果、传输终态也各落一行（含结果是否被采纳），所以"真 agent 干的"和"伪造的"事后可区分；`coc2 audit list` 查询
 - 基础监控上报 + 指标历史（每 Agent 最近 1000 条）
-- 运行日志可落盘并按大小轮转（`log_file` / `log_level` / `log_max_*`，默认 stderr）；审计历史保留可配（`audit_retention_days`，默认 0 = 永久保留，运维工具不擅自销毁证据）
+- 运行日志可落盘并按大小轮转（`log_file` / `log_level` / `log_max_*`，默认 stderr）；审计历史保留可配（`audit_retention_days`，默认 **14 天**，设为 `0` 则永久保留）
 - 本地可执行文件插件钩子（[plugins/README.md](plugins/README.md)）
 - CLI：紧凑 JSON / 退出码契约 / 无交互 / `--wait` 阻塞收结果 / `schema` 自描述
 
@@ -137,8 +142,9 @@ Go 缓存默认落在仓库本地 `.gocache_local/`、`.gomodcache_local/`，可
 | `-listen` | `listen` | `:8080` | Agent 面地址 |
 | `-operator-uds` | `operator_uds` | `./coc2.sock` | Operator 面 socket（空值需配合 `-operator-listen`） |
 | `-operator-listen` | `operator_listen` | 空 | Operator 面 TCP 逃生门（启用即强制 token） |
-| `-token` | `token` | — | Agent hello 共享 token（生产必换，`openssl rand -hex 32`） |
+| `-token` | `token` | — | Agent hello 共享 token（生产必换，`openssl rand -hex 32`）；仍为内置开发值时拒绝启动 |
 | `-api-token` | `api_token` | 同 `-token` | Operator 面 TCP 的 token |
+| `-allow-dev-token` | `allow_dev_token` | `false` | 允许用内置开发 token 启动（仅限本地一次性运行） |
 | `-db` | `db` | `coc2.db` | SQLite 路径 |
 | `-plugins` | `plugins` | `plugins` | 插件目录 |
 | `-tls-cert` / `-tls-key` | `tls_cert` / `tls_key` | 空 | 启用 TLS 1.3 |
@@ -168,6 +174,7 @@ Go 缓存默认落在仓库本地 `.gocache_local/`、`.gomodcache_local/`，可
 ./bin/coc2 agents list --online            # 在线清单
 ./bin/coc2 run --cmd "df -h" --agents web1 --wait
 ./bin/coc2 run --cmd "yum -y update" --tag env=prod --yes --wait
+./bin/coc2 run --cmd "tar czf /backup.tgz /srv" --agents web1 --priority 10 --wait
 ./bin/coc2 push --agent web1 --local ./app.bin --remote /opt/app.bin --wait
 ./bin/coc2 pull --agent web1 --remote /var/log/app.log --local ./app.log --wait
 ./bin/coc2 tasks cancel <task_id>
@@ -217,6 +224,8 @@ curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8081/api/v1/tasks   # op
 
 - **双平面隔离**：Agent 面只有 WS 升级与探针；全部管理 API 只在 Operator 面。
 - **默认 socket 边界**：Operator 面 `0600` Unix socket，token 不落配置文件；TCP 逃生门一旦启用，每请求强制恒定时间比较的 token（Bearer / Basic 两式）。
+- **Agent 面鉴权是连接级的**：hello 通过之前，除 `hello` 本身外任何消息都被拒绝并立即断开——未认证连接无法写入任务结果、指标或传输数据。每条已认证消息以连接身份为准（报文里自称的 `agent_id` 会被覆盖），任务结果只能落到该 agent 自己的任务上。
+- **默认 token 拒绝启动**：`coc2-dev-token` 是公开值，Server 见到它直接拒绝启动，除非显式 `-allow-dev-token`。
 - **无浏览器即拒浏览器**：携带任何 `Origin`（含 `null`）的 WS 握手一律拒绝。
 - **传输完整性**：分块 `Seq` 重排 + 缺包/重复检测 + SHA256 兜底。
 - **生产请 TLS**：Server 配 `tls_cert`/`tls_key`（可选 `client_ca` 开 mTLS），Agent 走 `wss://` + 证书参数；`-require-tls` 可硬约束。未启用 TLS 时两端都会打警告。
@@ -224,8 +233,10 @@ curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8081/api/v1/tasks   # op
 ## 任务执行语义
 
 - **至多一次派发**：任务成功发送给 Agent 即标 `dispatched`，不等 `task_ack`——ack 丢失不会导致重连后重复执行。
+- **结果只认归属**：结果写入要求任务仍是非终态、且属于上报的连接身份；终态一旦落库不会被迟到或伪造的结果改写，被拒绝的结果仍记审计（`ok=false`）。
 - **回收器兜底**：`dispatched`/`cancel_requested` 超 `timeout_secs + 30s` 无结果，Server 标记 `timeout`/`canceled`。
 - **进程组隔离**：Agent 以独立进程组执行，取消/超时终止整棵进程树。
+- **并发上限**：Agent 同时最多跑 16 个任务；超出的派发立刻以 `failed` 结果回绝，而不是静默丢弃。
 - 终态枚举：`success | failed | timeout | canceled`。
 
 ## 插件

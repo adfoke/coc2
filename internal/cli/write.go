@@ -83,6 +83,7 @@ func addWriteCommands(r *Registry) {
 			{Name: "group", Type: "stringlist", Desc: "target group ids"},
 			{Name: "tag", Type: "stringlist", Desc: "target tags (k or k=v)"},
 			{Name: "exec-timeout", Type: "int", Default: "60", Desc: "execution timeout in SECONDS per agent (distinct from global -timeout, which is the HTTP request duration)"},
+			{Name: "priority", Type: "int", Default: "0", Desc: "dispatch priority; higher runs first when an agent has queued work"},
 			{Name: "wait", Type: "bool", Desc: "block until every task reaches a terminal state"},
 			{Name: "wait-timeout", Type: "duration", Default: "90s", Desc: "CLI polling budget for --wait; must cover exec-timeout"},
 			{Name: "yes", Type: "bool", Desc: "REQUIRED whenever the selector can fan out: any --group/--tag value, or more than one --agents token"},
@@ -110,6 +111,9 @@ func addWriteCommands(r *Registry) {
 			}
 			targets["command"] = cmd
 			targets["timeout_secs"] = cf.Int("exec-timeout")
+			if p := cf.Int("priority"); p != 0 {
+				targets["priority"] = p
+			}
 
 			var resp struct {
 				Count int                `json:"count"`

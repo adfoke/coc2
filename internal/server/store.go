@@ -583,16 +583,47 @@ func (s *Store) markTaskFinal(taskID, agentID, status, stderr string, at time.Ti
 	return true, tx.Commit()
 }
 
-func (s *Store) SaveResult(result protocol.TaskResult) error {
+// terminalTaskStates lists the states a task can never leave, as a bare SQL
+// list (callers wrap it in parentheses). Used both by SaveResult (a late
+// result must not rewrite a finalized task) and by the retention pruner.
+const terminalTaskStates = `'success','failed','timeout','canceled'`
+
+// nonTerminalTaskStates lists the states from which a result may be applied.
+// 'cancel_requested' is included deliberately: a cancel is only an intent
+// until the agent confirms, so a racing completion still records what really
+// happened (same contract as transfers; see cancelTransfer in transfer.go).
+// 'queued' is included because a dispatch mark and the agent's result are not
+// ordered by the database — the result must not be lost to that race.
+const nonTerminalTaskStates = `('queued','dispatched','cancel_requested')`
+
+// SaveResult records a task result reported by an agent. The write is
+// conditional on the task still being non-terminal AND belonging to the
+// reporting agent, so a forged or late result can neither invent a task nor
+// overwrite a finalized outcome. It returns applied=false when the task was
+// already terminal, belonged to a different agent, or does not exist.
+func (s *Store) SaveResult(result protocol.TaskResult) (bool, error) {
 	tx, err := s.db.Begin()
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer tx.Rollback()
 
-	if _, err := tx.Exec(`UPDATE tasks SET state = ? WHERE id = ?`, result.Status, result.TaskID); err != nil {
-		return err
+	res, err := tx.Exec(`
+		UPDATE tasks SET state = ?
+		WHERE id = ? AND agent_id = ? AND state IN `+nonTerminalTaskStates,
+		result.Status, result.TaskID, result.AgentID,
+	)
+	if err != nil {
+		return false, err
 	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	if affected == 0 {
+		return false, nil
+	}
+
 	if _, err := tx.Exec(`
 		INSERT INTO task_results(task_id, agent_id, status, exit_code, stdout, stderr, duration_ms, completed_at)
 		VALUES(?, ?, ?, ?, ?, ?, ?, ?)
@@ -605,10 +636,10 @@ func (s *Store) SaveResult(result protocol.TaskResult) error {
 			duration_ms = excluded.duration_ms,
 			completed_at = excluded.completed_at
 	`, result.TaskID, result.AgentID, result.Status, result.ExitCode, result.Stdout, result.Stderr, result.DurationMS, result.CompletedAt.UTC().Format(time.RFC3339Nano)); err != nil {
-		return err
+		return false, err
 	}
 
-	return tx.Commit()
+	return true, tx.Commit()
 }
 
 func (s *Store) Task(taskID string) (taskStatus, bool, error) {

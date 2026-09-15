@@ -86,15 +86,19 @@ func TestStoreTaskLifecycleAndPersistence(t *testing.T) {
 		t.Fatalf("unexpected task state after ack: %+v", item)
 	}
 
-	if err := store.SaveResult(protocol.TaskResult{
+	applied, err := store.SaveResult(protocol.TaskResult{
 		TaskID:      "task-1",
 		AgentID:     "agent-1",
 		Status:      "success",
 		ExitCode:    0,
 		Stdout:      "ok\n",
 		CompletedAt: time.Now().UTC(),
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatalf("save result: %v", err)
+	}
+	if !applied {
+		t.Fatalf("result for a dispatched task must be applied")
 	}
 
 	if err := store.Close(); err != nil {

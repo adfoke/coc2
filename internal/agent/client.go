@@ -32,7 +32,29 @@ const (
 	maxTaskOutputBytes = 1 << 20
 	maxCachedResults   = 256
 	cachedResultTTL    = 10 * time.Minute
+
+	// maxInboundFrameBytes bounds a single frame from the server. The server
+	// already caps what it sends; this is the agent's own defence so a
+	// hostile or buggy peer cannot make it allocate without limit. It matches
+	// the server's own SetReadLimit.
+	maxInboundFrameBytes = 16 << 20
+
+	// maxConcurrentTasks bounds how many shell tasks run at once. Every task
+	// is a process group plus up to 2 MiB of captured output, so without a
+	// cap a burst of dispatches (or a compromised server) could exhaust the
+	// agent host. Excess dispatches are answered with a failed result rather
+	// than silently dropped, so the operator sees why nothing ran.
+	maxConcurrentTasks = 16
+
+	// agentWriteTimeout bounds one websocket write. Generous enough for a
+	// 256 KiB chunk over a slow link, short enough that a dead peer cannot
+	// hold writeMu indefinitely.
+	agentWriteTimeout = 30 * time.Second
 )
+
+// errTooManyTasks is reported back for a dispatch that arrived while
+// maxConcurrentTasks were already running.
+var errTooManyTasks = errors.New("agent is already running the maximum number of tasks")
 
 type Client struct {
 	cfg       Config
@@ -169,6 +191,12 @@ func (c *Client) runOnce(ctx context.Context) error {
 	}
 	defer conn.Close()
 
+	// Mirror the server's read limit: a single frame larger than this is a
+	// protocol violation, not something to buffer. (No read deadline here:
+	// the client does not answer the server's pings, and liveness is already
+	// covered by the heartbeat write failing on a dead link.)
+	conn.SetReadLimit(maxInboundFrameBytes)
+
 	// Fresh connection: fall back to legacy framing until the peer proves
 	// protobuf support, then upgrade mid-session at hello_ack.
 	c.binaryOut.Store(false)
@@ -235,7 +263,22 @@ func (c *Client) runOnce(ctx context.Context) error {
 			if c.taskRunning(task.ID) {
 				continue
 			}
-			c.startTask(ctx, conn, task)
+			if !c.startTask(ctx, conn, task) {
+				// Refusing silently would leave the server waiting for a
+				// result that never comes; report why instead.
+				result := protocol.TaskResult{
+					TaskID:      task.ID,
+					AgentID:     c.agentID,
+					Status:      "failed",
+					ExitCode:    -1,
+					Stderr:      errTooManyTasks.Error(),
+					CompletedAt: time.Now().UTC(),
+				}
+				c.cacheResult(result)
+				if err := c.send(conn, protocol.TypeTaskResult, result); err != nil {
+					return err
+				}
+			}
 		case protocol.TypeTaskCancel:
 			cancelMsg, err := protocol.PayloadOf[protocol.TaskCancel](in)
 			if err != nil {
@@ -298,12 +341,53 @@ func (c *Client) heartbeatLoop(ctx context.Context, conn *websocket.Conn, done <
 	}
 }
 
-func (c *Client) startTask(ctx context.Context, conn *websocket.Conn, task protocol.Task) {
+// taskAdmission is the outcome of trying to reserve a slot for a dispatch.
+type taskAdmission int
+
+const (
+	// taskReserved: the caller owns a slot and must run the task.
+	taskReserved taskAdmission = iota
+	// taskDuplicate: this task id is already running; the dispatch is a
+	// retransmission and must be ignored, not answered.
+	taskDuplicate
+	// taskAtCapacity: maxConcurrentTasks are already running.
+	taskAtCapacity
+)
+
+// tryReserveTask claims a concurrency slot for task under taskMu. It reports
+// why admission was refused so the caller can distinguish a retransmission
+// from genuine overload. On success the returned cancel func is already
+// registered, so unregisterTask is the only cleanup needed.
+func (c *Client) tryReserveTask(task protocol.Task, cancel context.CancelFunc) taskAdmission {
+	c.taskMu.Lock()
+	defer c.taskMu.Unlock()
+
+	if _, running := c.running[task.ID]; running {
+		return taskDuplicate
+	}
+	if len(c.running) >= maxConcurrentTasks {
+		return taskAtCapacity
+	}
+	c.running[task.ID] = cancel
+	return taskReserved
+}
+
+// startTask launches a task unless the concurrency cap is already reached. It
+// reports whether the task was started; a false return means the caller must
+// answer the dispatch itself.
+func (c *Client) startTask(ctx context.Context, conn *websocket.Conn, task protocol.Task) bool {
 	runCtx, cancel := context.WithTimeout(ctx, time.Duration(task.TimeoutSecs)*time.Second)
 
-	c.taskMu.Lock()
-	c.running[task.ID] = cancel
-	c.taskMu.Unlock()
+	if admission := c.tryReserveTask(task, cancel); admission != taskReserved {
+		cancel()
+		if admission == taskAtCapacity {
+			c.logger.Warn("task refused: concurrency limit reached",
+				zap.String("task_id", task.ID), zap.Int("limit", maxConcurrentTasks))
+			return false
+		}
+		// Duplicate: the running copy already owns the slot. Nothing to do.
+		return true
+	}
 
 	go func() {
 		defer cancel()
@@ -315,6 +399,7 @@ func (c *Client) startTask(ctx context.Context, conn *websocket.Conn, task proto
 			c.logger.Warn("send result", zap.String("task_id", task.ID), zap.Error(err))
 		}
 	}()
+	return true
 }
 
 // runCommand executes a single shell task and returns its result. The shell is
@@ -831,6 +916,10 @@ func (c *Client) send(conn *websocket.Conn, msgType string, payload any) error {
 
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
+	// Without a write deadline a peer that stops reading blocks this call
+	// forever while holding writeMu — which stalls heartbeats and every task
+	// result queued behind them, turning a slow reader into a silent hang.
+	_ = conn.SetWriteDeadline(time.Now().Add(agentWriteTimeout))
 	return conn.WriteMessage(opcode, msg)
 }
 

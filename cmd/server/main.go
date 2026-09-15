@@ -18,6 +18,9 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
+	if err := validateServerConfig(cfg, cfg.AllowDevToken); err != nil {
+		panic(err)
+	}
 
 	logger, closeLogs, err := logging.New(logging.Options{
 		File:       cfg.LogFile,

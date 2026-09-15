@@ -29,6 +29,7 @@ coc2 schema
 - 同机默认：什么都不用配，CLI 默认连 `./coc2.sock`（server 启动目录下的 UDS，免 token）。
 - 远程/TCP：`-server http://host:8081 -token $T`，或 env `COC2_SERVER` / `COC2_TOKEN`。
 - 全局 flag 可出现在 argv 任意位置（`coc2 agents list --pretty -server /x.sock` 合法）。
+- server 侧的 `token` 若仍是内置的 `coc2-dev-token`，server 会**拒绝启动**（它是公开值）。运维要用 `-token $(openssl rand -hex 32)`，或写进 `config.yaml` 的 `token`；本地一次性运行可加 `-allow-dev-token`。遇到 server 起不来看这条。
 
 ## 典型工作流
 

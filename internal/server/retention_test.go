@@ -28,7 +28,7 @@ func seedHistory(t *testing.T, store *Store, old time.Time) {
 	if err := store.AddTask(protocol.Task{ID: "old-task", AgentID: "a1", Type: "shell", Command: "echo", TimeoutSecs: 5, CreatedAt: old}); err != nil {
 		t.Fatalf("seed old task: %v", err)
 	}
-	if err := store.SaveResult(protocol.TaskResult{TaskID: "old-task", AgentID: "a1", Status: "success", CompletedAt: old}); err != nil {
+	if _, err := store.SaveResult(protocol.TaskResult{TaskID: "old-task", AgentID: "a1", Status: "success", CompletedAt: old}); err != nil {
 		t.Fatalf("seed old result: %v", err)
 	}
 
@@ -57,7 +57,7 @@ func TestPruneAuditsDeletesOldKeepsNew(t *testing.T) {
 	if err := store.AddTask(protocol.Task{ID: "new-task", AgentID: "a1", Type: "shell", Command: "echo", TimeoutSecs: 5, CreatedAt: now}); err != nil {
 		t.Fatalf("seed new task: %v", err)
 	}
-	if err := store.SaveResult(protocol.TaskResult{TaskID: "new-task", AgentID: "a1", Status: "success", CompletedAt: now}); err != nil {
+	if _, err := store.SaveResult(protocol.TaskResult{TaskID: "new-task", AgentID: "a1", Status: "success", CompletedAt: now}); err != nil {
 		t.Fatalf("seed new result: %v", err)
 	}
 	if err := store.UpsertTransferAudit(TransferAudit{
@@ -148,7 +148,7 @@ func TestPruneAuditsSweepsOrphanResults(t *testing.T) {
 	if err := store.AddTask(protocol.Task{ID: "orphan-task", AgentID: "a1", Type: "shell", Command: "echo", TimeoutSecs: 5, CreatedAt: old}); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
-	if err := store.SaveResult(protocol.TaskResult{TaskID: "orphan-task", AgentID: "a1", Status: "success", CompletedAt: old}); err != nil {
+	if _, err := store.SaveResult(protocol.TaskResult{TaskID: "orphan-task", AgentID: "a1", Status: "success", CompletedAt: old}); err != nil {
 		t.Fatalf("seed result: %v", err)
 	}
 	if _, err := store.db.Exec(`DELETE FROM tasks WHERE id = 'orphan-task'`); err != nil {
@@ -171,9 +171,10 @@ func TestPruneAuditsSweepsOrphanResults(t *testing.T) {
 	}
 }
 
-func TestRetentionOffByDefault(t *testing.T) {
-	// AuditRetentionDays == 0 must keep ancient rows: deleting evidence by
-	// default is the wrong behaviour for an ops tool.
+func TestRetentionZeroKeepsEverythingForever(t *testing.T) {
+	// audit_retention_days == 0 is the explicit "keep everything" choice
+	// (the shipped default is DefaultAuditRetentionDays, applied by the
+	// config loader). A zero-value Config must therefore never delete.
 	svc, cleanup := newTestService(t)
 	defer cleanup()
 
@@ -212,12 +213,50 @@ func TestRetentionRunsWhenConfigured(t *testing.T) {
 	}
 }
 
+// TestDefaultRetentionWindowIsTwoWeeks pins the shipped default and proves it
+// actually prunes: a 30-day-old row must go, a 3-day-old row must stay.
+func TestDefaultRetentionWindowIsTwoWeeks(t *testing.T) {
+	if DefaultAuditRetentionDays != 14 {
+		t.Fatalf("default retention = %d days, want 14", DefaultAuditRetentionDays)
+	}
+
+	svc, cleanup := newTestService(t)
+	defer cleanup()
+	svc.cfg.AuditRetentionDays = DefaultAuditRetentionDays
+
+	now := time.Now().UTC()
+	for _, row := range []struct {
+		requestID string
+		age       time.Time
+	}{
+		{"beyond-window", now.AddDate(0, 0, -30)},
+		{"inside-window", now.AddDate(0, 0, -3)},
+	} {
+		if err := svc.store.AddOpLog(OpLogEntry{
+			RequestID: row.requestID, TS: row.age, Plane: "uds", Actor: "a",
+			Method: "POST", Path: "/p", Status: 202, OK: true,
+		}); err != nil {
+			t.Fatalf("seed %s: %v", row.requestID, err)
+		}
+	}
+
+	svc.pruneAuditsIfNeeded(now)
+
+	entries, err := svc.store.RecentOpLogs(OpLogQuery{Limit: 50})
+	if err != nil {
+		t.Fatalf("read oplog: %v", err)
+	}
+	if len(entries) != 1 || entries[0].RequestID != "inside-window" {
+		t.Fatalf("14-day window kept the wrong rows: %+v", entries)
+	}
+}
+
 func TestShutdownStopsExtendedReapLoop(t *testing.T) {
 	// reapLoop now also drives the daily prune; the stop/close handshake
 	// must still cover the extended loop body so Shutdown returns.
 	svc, err := New(Config{
 		ListenAddr:      ":0",
-		OperatorUDSPath: filepath.Join(t.TempDir(), "s.sock"),
+		OperatorUDSPath: shortSockPath(t),
 		AuthToken:       "tok",
 		DBPath:          filepath.Join(t.TempDir(), "t.db"),
 		WriteWait:       time.Second,

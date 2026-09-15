@@ -101,7 +101,10 @@ func codecFor(msgType string) (toProto func(any) (proto.Message, error), fromPro
 	switch msgType {
 	case TypeHello:
 		return func(v any) (proto.Message, error) {
-				m := v.(AgentHello)
+				m, ok := v.(AgentHello)
+				if !ok {
+					return nil, errType(msgType, v)
+				}
 				return &pb.AgentHello{
 					AgentId: m.AgentID, Token: m.Token, Hostname: m.Hostname,
 					Os: m.OS, Arch: m.Arch, IpAddrs: m.IPAddrs, Tags: m.Tags,
@@ -122,7 +125,10 @@ func codecFor(msgType string) (toProto func(any) (proto.Message, error), fromPro
 			}, true
 	case TypeHelloAck:
 		return func(v any) (proto.Message, error) {
-				m := v.(HelloAck)
+				m, ok := v.(HelloAck)
+				if !ok {
+					return nil, errType(msgType, v)
+				}
 				return &pb.HelloAck{
 					ServerTime: toProtoTime(m.ServerTime), AgentId: m.AgentID,
 					PendingTasks: tasksToProto(m.PendingTasks),
@@ -139,7 +145,10 @@ func codecFor(msgType string) (toProto func(any) (proto.Message, error), fromPro
 			}, true
 	case TypeHeartbeat:
 		return func(v any) (proto.Message, error) {
-				m := v.(Heartbeat)
+				m, ok := v.(Heartbeat)
+				if !ok {
+					return nil, errType(msgType, v)
+				}
 				return &pb.Heartbeat{AgentId: m.AgentID, Timestamp: toProtoTime(m.Timestamp)}, nil
 			}, func(pm proto.Message) (any, error) {
 				m, ok := pm.(*pb.Heartbeat)
@@ -150,7 +159,10 @@ func codecFor(msgType string) (toProto func(any) (proto.Message, error), fromPro
 			}, true
 	case TypeMetricsReport:
 		return func(v any) (proto.Message, error) {
-				m := v.(MetricsReport)
+				m, ok := v.(MetricsReport)
+				if !ok {
+					return nil, errType(msgType, v)
+				}
 				return &pb.MetricsReport{
 					AgentId: m.AgentID, Timestamp: toProtoTime(m.Timestamp),
 					UptimeSecs: m.UptimeSecs, CpuCount: int32(m.CPUCount),
@@ -171,7 +183,11 @@ func codecFor(msgType string) (toProto func(any) (proto.Message, error), fromPro
 			}, true
 	case TypeTaskDispatch:
 		return func(v any) (proto.Message, error) {
-				return taskToProto(v.(Task)), nil
+				m, ok := v.(Task)
+				if !ok {
+					return nil, errType(msgType, v)
+				}
+				return taskToProto(m), nil
 			}, func(pm proto.Message) (any, error) {
 				m, ok := pm.(*pb.Task)
 				if !ok {
@@ -181,7 +197,10 @@ func codecFor(msgType string) (toProto func(any) (proto.Message, error), fromPro
 			}, true
 	case TypeTaskAck:
 		return func(v any) (proto.Message, error) {
-				m := v.(TaskAck)
+				m, ok := v.(TaskAck)
+				if !ok {
+					return nil, errType(msgType, v)
+				}
 				return &pb.TaskAck{TaskId: m.TaskID, AgentId: m.AgentID, ReceivedAt: toProtoTime(m.ReceivedAt)}, nil
 			}, func(pm proto.Message) (any, error) {
 				m, ok := pm.(*pb.TaskAck)
@@ -192,7 +211,10 @@ func codecFor(msgType string) (toProto func(any) (proto.Message, error), fromPro
 			}, true
 	case TypeTaskCancel:
 		return func(v any) (proto.Message, error) {
-				m := v.(TaskCancel)
+				m, ok := v.(TaskCancel)
+				if !ok {
+					return nil, errType(msgType, v)
+				}
 				return &pb.TaskCancel{TaskId: m.TaskID, AgentId: m.AgentID, RequestedAt: toProtoTime(m.RequestedAt)}, nil
 			}, func(pm proto.Message) (any, error) {
 				m, ok := pm.(*pb.TaskCancel)
@@ -203,7 +225,10 @@ func codecFor(msgType string) (toProto func(any) (proto.Message, error), fromPro
 			}, true
 	case TypeTaskResult:
 		return func(v any) (proto.Message, error) {
-				m := v.(TaskResult)
+				m, ok := v.(TaskResult)
+				if !ok {
+					return nil, errType(msgType, v)
+				}
 				return &pb.TaskResult{
 					TaskId: m.TaskID, AgentId: m.AgentID, Status: m.Status,
 					ExitCode: int32(m.ExitCode), Stdout: []byte(m.Stdout), Stderr: []byte(m.Stderr),
@@ -222,7 +247,10 @@ func codecFor(msgType string) (toProto func(any) (proto.Message, error), fromPro
 			}, true
 	case TypeFileTransferStart:
 		return func(v any) (proto.Message, error) {
-				m := v.(FileTransferStart)
+				m, ok := v.(FileTransferStart)
+				if !ok {
+					return nil, errType(msgType, v)
+				}
 				return &pb.FileTransferStart{
 					TransferId: m.TransferID, AgentId: m.AgentID, Direction: m.Direction,
 					LocalPath: m.LocalPath, RemotePath: m.RemotePath, Size: m.Size,
@@ -243,7 +271,10 @@ func codecFor(msgType string) (toProto func(any) (proto.Message, error), fromPro
 			}, true
 	case TypeFileTransferChunk:
 		return func(v any) (proto.Message, error) {
-				m := v.(FileTransferChunk)
+				m, ok := v.(FileTransferChunk)
+				if !ok {
+					return nil, errType(msgType, v)
+				}
 				return &pb.FileTransferChunk{TransferId: m.TransferID, Seq: int32(m.Seq), Data: m.Data}, nil
 			}, func(pm proto.Message) (any, error) {
 				m, ok := pm.(*pb.FileTransferChunk)
@@ -254,7 +285,10 @@ func codecFor(msgType string) (toProto func(any) (proto.Message, error), fromPro
 			}, true
 	case TypeFileTransferResume:
 		return func(v any) (proto.Message, error) {
-				m := v.(FileTransferResume)
+				m, ok := v.(FileTransferResume)
+				if !ok {
+					return nil, errType(msgType, v)
+				}
 				return &pb.FileTransferResume{TransferId: m.TransferID, AgentId: m.AgentID, Offset: m.Offset}, nil
 			}, func(pm proto.Message) (any, error) {
 				m, ok := pm.(*pb.FileTransferResume)
@@ -265,7 +299,10 @@ func codecFor(msgType string) (toProto func(any) (proto.Message, error), fromPro
 			}, true
 	case TypeFileTransferCancel:
 		return func(v any) (proto.Message, error) {
-				m := v.(FileTransferCancel)
+				m, ok := v.(FileTransferCancel)
+				if !ok {
+					return nil, errType(msgType, v)
+				}
 				return &pb.FileTransferCancel{TransferId: m.TransferID, AgentId: m.AgentID, RequestedAt: toProtoTime(m.RequestedAt)}, nil
 			}, func(pm proto.Message) (any, error) {
 				m, ok := pm.(*pb.FileTransferCancel)
@@ -276,7 +313,10 @@ func codecFor(msgType string) (toProto func(any) (proto.Message, error), fromPro
 			}, true
 	case TypeFileTransferDone:
 		return func(v any) (proto.Message, error) {
-				m := v.(FileTransferDone)
+				m, ok := v.(FileTransferDone)
+				if !ok {
+					return nil, errType(msgType, v)
+				}
 				return &pb.FileTransferDone{
 					TransferId: m.TransferID, AgentId: m.AgentID, Direction: m.Direction,
 					Status: m.Status, Message: m.Message, Size: m.Size,
@@ -295,7 +335,10 @@ func codecFor(msgType string) (toProto func(any) (proto.Message, error), fromPro
 			}, true
 	case TypeError:
 		return func(v any) (proto.Message, error) {
-				m := v.(ErrorMessage)
+				m, ok := v.(ErrorMessage)
+				if !ok {
+					return nil, errType(msgType, v)
+				}
 				return &pb.ErrorMessage{Code: m.Code, Message: m.Message}, nil
 			}, func(pm proto.Message) (any, error) {
 				m, ok := pm.(*pb.ErrorMessage)
@@ -309,7 +352,12 @@ func codecFor(msgType string) (toProto func(any) (proto.Message, error), fromPro
 	}
 }
 
-func errType(msgType string, got proto.Message) error {
+// errType reports a payload whose Go type does not match the envelope's
+// message type. It is the checked replacement for the unchecked type
+// assertions this codec used to rely on: the invariant "the caller passes the
+// payload type matching msgType" is real but implicit, and a failed assertion
+// would take down the whole process instead of failing one message.
+func errType(msgType string, got any) error {
 	return fmt.Errorf("wire: payload for %q is %T", msgType, got)
 }
 

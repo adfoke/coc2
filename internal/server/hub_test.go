@@ -332,7 +332,7 @@ func setTestAuth(req *http.Request) {
 }
 
 func TestOperatorUDSNoTokenAndMode(t *testing.T) {
-	sock := filepath.Join(t.TempDir(), "op.sock")
+	sock := shortSockPath(t)
 	svc, err := New(Config{
 		ListenAddr:      ":0",
 		OperatorUDSPath: sock,

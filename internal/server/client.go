@@ -2,6 +2,7 @@ package server
 
 import (
 	"crypto/subtle"
+	"fmt"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -33,6 +34,25 @@ func (a *agentConn) readLoop() {
 		if err != nil {
 			a.service.logger.Warn("bad frame", zap.String("agent_id", a.id), zap.Int("opcode", opcode), zap.Error(err))
 			continue
+		}
+
+		// Authentication is a property of the CONNECTION, not of one message
+		// type. Until hello has been accepted (a.id is set by register), the
+		// only frame this peer may send is hello; anything else would let an
+		// unauthenticated TCP client write task results, metrics, or transfer
+		// data for arbitrary agent ids. Heartbeat used to be the only guarded
+		// case, and it merely `continue`d — leaving the connection alive.
+		switch {
+		case in.MsgType == protocol.TypeHello:
+			if a.id != "" {
+				// Already authenticated on this connection: a second hello
+				// would re-run register and displace the live entry.
+				a.sendProtocolError("already_registered", "hello already accepted on this connection")
+				return
+			}
+		case a.id == "":
+			a.sendProtocolError("not_registered", "hello is required first")
+			return // close: an unauthenticated peer gets no second chance
 		}
 
 		switch in.MsgType {
@@ -78,11 +98,17 @@ func (a *agentConn) readLoop() {
 			}
 			a.service.plugins.Trigger("agent_connected", hello)
 			a.service.logger.Info("agent connected", zap.String("agent_id", hello.AgentID), zap.String("hostname", hello.Hostname))
+			a.service.auditAgentEvent(a, agentEvent{
+				Kind:    "connect",
+				AgentID: hello.AgentID,
+				OK:      true,
+				Summary: fmt.Sprintf("host=%s os=%s arch=%s version=%s pending=%d",
+					truncateForLog(hello.Hostname, 64), hello.OS, hello.Arch,
+					truncateForLog(hello.Version, 32), len(pending)),
+			})
 		case protocol.TypeHeartbeat:
-			if a.id == "" {
-				a.sendProtocolError("not_registered", "hello is required first")
-				continue
-			}
+			// a.id is non-empty here: the gate above closes the connection
+			// for any non-hello frame on an unauthenticated connection.
 			if _, err := protocol.PayloadOf[protocol.Heartbeat](in); err != nil {
 				a.sendProtocolError("bad_heartbeat", err.Error())
 				continue
@@ -94,26 +120,48 @@ func (a *agentConn) readLoop() {
 				a.sendProtocolError("bad_result", err.Error())
 				continue
 			}
-			if err := a.service.store.SaveResult(result); err != nil {
+			// The wire carries an agent_id, but the only trustworthy identity
+			// is the one this connection authenticated with. Overwrite it so
+			// a peer cannot attribute its result to another agent.
+			result.AgentID = a.id
+			applied, err := a.service.store.SaveResult(result)
+			if err != nil {
 				a.service.logger.Warn("save result", zap.String("task_id", result.TaskID), zap.Error(err))
 				continue
 			}
+			if !applied {
+				// Already final, owned by another agent, or unknown. The
+				// store refused it, so nothing was changed — but the attempt
+				// is exactly what an investigator needs to see.
+				a.service.logger.Warn("discarded result for non-live task",
+					zap.String("task_id", result.TaskID),
+					zap.String("agent_id", a.id))
+			}
 			a.service.plugins.Trigger("task_result", result)
-			a.service.touch(result.AgentID)
+			a.service.touch(a.id)
+			a.service.auditAgentEvent(a, agentEvent{
+				Kind:    "task_result",
+				AgentID: a.id,
+				OK:      applied,
+				Ref:     "task_id=" + truncateForLog(result.TaskID, 64),
+				Summary: fmt.Sprintf("status=%s exit=%d applied=%t", result.Status, result.ExitCode, applied),
+			})
 		case protocol.TypeTaskAck:
-			ack, err := protocol.PayloadOf[protocol.TaskAck](in)
-			if err != nil {
+			if _, err := protocol.PayloadOf[protocol.TaskAck](in); err != nil {
 				a.sendProtocolError("bad_task_ack", err.Error())
 				continue
 			}
-			a.service.touch(ack.AgentID)
+			a.service.touch(a.id)
 		case protocol.TypeMetricsReport:
 			report, err := protocol.PayloadOf[protocol.MetricsReport](in)
 			if err != nil {
 				a.sendProtocolError("bad_metrics_report", err.Error())
 				continue
 			}
-			a.service.handleMetricsReport(report)
+			report.AgentID = a.id
+			if err := a.service.handleMetricsReport(report); err != nil {
+				a.sendProtocolError("metrics_rejected", err.Error())
+			}
 		case protocol.TypeFileTransferStart:
 			start, err := protocol.PayloadOf[protocol.FileTransferStart](in)
 			if err != nil {
@@ -141,7 +189,16 @@ func (a *agentConn) readLoop() {
 				a.sendProtocolError("bad_transfer_done", err.Error())
 				continue
 			}
-			a.service.handleTransferDone(done)
+			live := a.service.handleTransferDone(done)
+			// A done for an id the server is not tracking is either a stale
+			// frame or someone guessing ids; either way it is audit-worthy.
+			a.service.auditAgentEvent(a, agentEvent{
+				Kind:    "transfer_done",
+				AgentID: a.id,
+				OK:      live,
+				Ref:     "transfer_id=" + truncateForLog(done.TransferID, 64),
+				Summary: fmt.Sprintf("direction=%s status=%s applied=%t", done.Direction, done.Status, live),
+			})
 		default:
 			a.sendProtocolError("unsupported_type", in.MsgType)
 		}
@@ -152,12 +209,18 @@ func (a *agentConn) writeLoop() {
 	ticker := time.NewTicker(a.service.cfg.PingPeriod)
 	defer func() {
 		ticker.Stop()
+		// Signal that the queue is drained (or the writer is gone) so a
+		// graceful close can proceed without cutting off queued frames.
+		a.closeRun.Do(func() { close(a.drained) })
 		a.close()
 	}()
 
 	for {
 		select {
-		case msg := <-a.send:
+		case msg, ok := <-a.send:
+			if !ok {
+				return
+			}
 			a.conn.SetWriteDeadline(time.Now().Add(a.service.cfg.WriteWait))
 			if err := a.conn.WriteMessage(msg.opcode, msg.data); err != nil {
 				return
@@ -200,6 +263,14 @@ func (a *agentConn) sendMessage(msgType string, payload any) error {
 		frame = wsFrame{opcode: websocket.TextMessage, data: data}
 	}
 
+	// sendMu serializes against closeSend, which closes the channel: a send
+	// on a closed channel panics, so the two must not interleave.
+	a.sendMu.Lock()
+	defer a.sendMu.Unlock()
+	if a.sendClosed {
+		return websocket.ErrCloseSent
+	}
+
 	select {
 	case a.send <- frame:
 		return nil
@@ -218,6 +289,32 @@ func (a *agentConn) close() {
 		close(a.done)
 		_ = a.conn.Close()
 	})
+}
+
+// closeSend closes the outbound queue exactly once. The writeLoop drains what
+// is already queued before exiting, so a frame handed to send() before this
+// call is still written. Sends after it fail fast instead of panicking.
+func (a *agentConn) closeSend() {
+	a.sendMu.Lock()
+	defer a.sendMu.Unlock()
+	if a.sendClosed {
+		return
+	}
+	a.sendClosed = true
+	close(a.send)
+}
+
+// drainThenClose stops the writer and waits (bounded by the write timeout) for
+// the queue to be flushed before closing the socket. Without this, a
+// rejection frame queued just before the connection is torn down is lost, and
+// the peer sees a bare abnormal closure with no explanation.
+func (a *agentConn) drainThenClose() {
+	a.closeSend()
+	select {
+	case <-a.drained:
+	case <-time.After(a.service.cfg.WriteWait):
+	}
+	a.close()
 }
 
 func (a *agentConn) requeueTasks(tasks []protocol.Task) {

@@ -7,16 +7,15 @@ import (
 	"go.uber.org/zap"
 )
 
-// Audit retention. Off by default: an ops tool deleting its own evidence
-// without being asked is the wrong default. When audit_retention_days is
-// set, a prune runs at startup and once per day afterwards.
+// Audit retention. On by default with a two-week window; setting
+// audit_retention_days to 0 keeps everything forever, which is an explicit
+// operator choice. A prune runs at startup and once per day afterwards.
 
 const pruneInterval = 24 * time.Hour
 
-// terminalTaskStates are finalized tasks: history, eligible for retention.
-// Anything else (queued/dispatched/cancel_requested) is live work and is
-// never pruned regardless of age.
-var terminalTaskStates = "'success','failed','timeout','canceled'"
+// terminalTaskStates (defined in store.go) lists finalized task states:
+// history, eligible for retention. Anything else (queued/dispatched/
+// cancel_requested) is live work and is never pruned regardless of age.
 
 // PruneAudits deletes audit/history rows strictly older than the cutoff and
 // returns per-table removal counts. Ordering matters: terminal tasks go

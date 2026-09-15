@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"coc2/internal/server"
 )
 
 func TestLoadServerConfigFromYAML(t *testing.T) {
@@ -109,7 +111,102 @@ func TestLoadServerConfigLoggingDefaultsOff(t *testing.T) {
 	if cfg.LogFile != "" {
 		t.Fatalf("default must log to stderr, got file %q", cfg.LogFile)
 	}
+	if cfg.AuditRetentionDays != server.DefaultAuditRetentionDays {
+		t.Fatalf("retention must default to %d days, got %d",
+			server.DefaultAuditRetentionDays, cfg.AuditRetentionDays)
+	}
+}
+
+// TestAuditRetentionAbsentKeyKeepsDefault: an absent key must not silently
+// mean "keep forever", which is what a bare int decode would produce.
+func TestAuditRetentionAbsentKeyKeepsDefault(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	// Every key EXCEPT audit_retention_days.
+	if err := os.WriteFile(path, []byte("listen: \":9090\"\ntoken: t\n"), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := loadServerConfig([]string{"-config", path})
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if cfg.AuditRetentionDays != server.DefaultAuditRetentionDays {
+		t.Fatalf("absent key gave %d, want the %d-day default",
+			cfg.AuditRetentionDays, server.DefaultAuditRetentionDays)
+	}
+}
+
+// TestAuditRetentionExplicitZeroKeepsForever: 0 written on purpose must
+// survive, because that is how an operator opts out of pruning entirely.
+func TestAuditRetentionExplicitZeroKeepsForever(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(path, []byte("listen: \":9090\"\ntoken: t\naudit_retention_days: 0\n"), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := loadServerConfig([]string{"-config", path})
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
 	if cfg.AuditRetentionDays != 0 {
-		t.Fatalf("retention must default to off (0), got %d", cfg.AuditRetentionDays)
+		t.Fatalf("explicit 0 became %d; keep-forever must be honoured", cfg.AuditRetentionDays)
+	}
+}
+
+// TestAuditRetentionExplicitValueWins covers the ordinary override.
+func TestAuditRetentionExplicitValueWins(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(path, []byte("listen: \":9090\"\ntoken: t\naudit_retention_days: 45\n"), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := loadServerConfig([]string{"-config", path})
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if cfg.AuditRetentionDays != 45 {
+		t.Fatalf("explicit value became %d, want 45", cfg.AuditRetentionDays)
+	}
+}
+
+// TestValidateServerConfigRefusesDevToken: the shipped default token is public
+// knowledge, so starting with it silently would leave the agent plane open.
+func TestValidateServerConfigRefusesDevToken(t *testing.T) {
+	devToken := server.Config{ListenAddr: ":0", OperatorUDSPath: "./x.sock", AuthToken: server.DefaultAuthToken}
+
+	if err := validateServerConfig(devToken, false); err == nil {
+		t.Fatalf("expected the default development token to be refused")
+	}
+	// The escape hatch must work, or a local throwaway run is impossible.
+	if err := validateServerConfig(devToken, true); err != nil {
+		t.Fatalf("explicit opt-in must be allowed, got %v", err)
+	}
+
+	real := server.Config{ListenAddr: ":0", OperatorUDSPath: "./x.sock", AuthToken: "a-real-secret"}
+	if err := validateServerConfig(real, false); err != nil {
+		t.Fatalf("a real token must start without any flag, got %v", err)
+	}
+}
+
+// TestLoadServerConfigExposesAllowDevToken keeps the flag wired through the
+// loader, so main's call to validateServerConfig sees the operator's choice.
+func TestLoadServerConfigExposesAllowDevToken(t *testing.T) {
+	cfg, err := loadServerConfig([]string{"-allow-dev-token"})
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if !cfg.AllowDevToken {
+		t.Fatalf("-allow-dev-token did not reach the config")
+	}
+
+	cfg, err = loadServerConfig(nil)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if cfg.AllowDevToken {
+		t.Fatalf("AllowDevToken must default to false")
 	}
 }
