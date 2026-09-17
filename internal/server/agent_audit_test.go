@@ -23,7 +23,7 @@ func TestOplogRecordsAgentConnectAndResult(t *testing.T) {
 		ID: "task-audited", AgentID: "agent-e2e", Type: "shell",
 		Command: "true", TimeoutSecs: 60, CreatedAt: time.Now().UTC(),
 	}
-	if err := svc.store.AddTask(task); err != nil {
+	if err := svc.store.AddTask(task, time.Time{}); err != nil {
 		t.Fatalf("add task: %v", err)
 	}
 	if err := svc.store.MarkDispatched(task.ID); err != nil {

@@ -319,7 +319,10 @@ func (a *agentConn) drainThenClose() {
 
 func (a *agentConn) requeueTasks(tasks []protocol.Task) {
 	for _, task := range tasks {
-		if err := a.service.store.AddTask(task); err != nil {
+		// Requeue as immediately available. These tasks came from PendingTasks,
+		// which already filtered out anything with a future release_at, so any
+		// original spread window has elapsed and must not be reinstated.
+		if err := a.service.store.AddTask(task, time.Time{}); err != nil {
 			a.service.logger.Warn("requeue task", zap.String("task_id", task.ID), zap.Error(err))
 		}
 	}

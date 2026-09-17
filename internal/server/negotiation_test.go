@@ -84,7 +84,7 @@ func TestNegotiationUpgradesToProtobuf(t *testing.T) {
 	}
 
 	// A dispatched task must now travel as a binary frame too.
-	if _, err := svc.createTask("agent-e2e", "echo hi", 5, 0); err != nil {
+	if _, err := svc.createTask("agent-e2e", "echo hi", 5, 0, time.Time{}); err != nil {
 		t.Fatalf("create task: %v", err)
 	}
 	conn.SetReadDeadline(time.Now().Add(3 * time.Second))
@@ -130,7 +130,7 @@ func TestNegotiationLegacyStaysJSON(t *testing.T) {
 	}
 
 	// The legacy agent must still receive its task as JSON text.
-	if _, err := svc.createTask("agent-e2e", "uptime", 5, 0); err != nil {
+	if _, err := svc.createTask("agent-e2e", "uptime", 5, 0, time.Time{}); err != nil {
 		t.Fatalf("create task: %v", err)
 	}
 	conn.SetReadDeadline(time.Now().Add(3 * time.Second))
@@ -212,7 +212,7 @@ func TestBadFrameDoesNotKillSession(t *testing.T) {
 	}
 
 	// If the session survived, the next dispatch arrives as a binary frame.
-	if _, err := svc.createTask("agent-e2e", "echo alive", 5, 0); err != nil {
+	if _, err := svc.createTask("agent-e2e", "echo alive", 5, 0, time.Time{}); err != nil {
 		t.Fatalf("create task after garbage frame: %v", err)
 	}
 	conn.SetReadDeadline(time.Now().Add(3 * time.Second))

@@ -26,7 +26,7 @@ func TestStoreTaskLifecycleAndPersistence(t *testing.T) {
 		CreatedAt:   time.Now().UTC(),
 	}
 
-	if err := store.AddTask(task); err != nil {
+	if err := store.AddTask(task, time.Time{}); err != nil {
 		t.Fatalf("add task: %v", err)
 	}
 
@@ -143,7 +143,7 @@ func TestCancelQueuedTask(t *testing.T) {
 		TimeoutSecs: 60,
 		CreatedAt:   time.Now().UTC(),
 	}
-	if err := store.AddTask(task); err != nil {
+	if err := store.AddTask(task, time.Time{}); err != nil {
 		t.Fatalf("add task: %v", err)
 	}
 
@@ -317,6 +317,202 @@ func TestMetricsHistoryMigratesLegacySchema(t *testing.T) {
 	}
 	if len(history) != 2 {
 		t.Fatalf("expected 2 samples after migration, got %d", len(history))
+	}
+}
+
+// TestTaskReleaseAtRoundTrip covers the store half of batch spread: a deferred
+// task must stay invisible to both dispatch paths until its release time, then
+// become visible to the tick, with the timestamp surviving the round trip.
+func TestTaskReleaseAtRoundTrip(t *testing.T) {
+	store, err := NewStore(filepath.Join(t.TempDir(), "release.db"))
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+	defer store.Close()
+
+	now := time.Now().UTC()
+	release := now.Add(30 * time.Minute)
+
+	// Two deferred tasks due at the same instant (priority decides their
+	// order), plus one immediately-available task.
+	for _, task := range []protocol.Task{
+		{ID: "task-low", AgentID: "agent-1", Type: "shell", Command: "echo low", TimeoutSecs: 5, CreatedAt: now},
+		{ID: "task-high", AgentID: "agent-1", Type: "shell", Command: "echo high", TimeoutSecs: 5, Priority: 9, CreatedAt: now},
+	} {
+		if err := store.AddTask(task, release); err != nil {
+			t.Fatalf("add deferred %s: %v", task.ID, err)
+		}
+	}
+	immediate := protocol.Task{ID: "task-now", AgentID: "agent-1", Type: "shell", Command: "echo now", TimeoutSecs: 5, CreatedAt: now}
+	if err := store.AddTask(immediate, time.Time{}); err != nil {
+		t.Fatalf("add immediate task: %v", err)
+	}
+
+	// A reconnect must not flush deferred work early: only the immediate task
+	// is deliverable.
+	pending, err := store.PendingTasks("agent-1")
+	if err != nil {
+		t.Fatalf("pending tasks: %v", err)
+	}
+	if len(pending) != 1 || pending[0].ID != "task-now" {
+		t.Fatalf("pending = %+v, want only the immediate task", pending)
+	}
+
+	// Neither may the tick, until the window opens.
+	if ready, err := store.ReadyQueuedTasks(now); err != nil {
+		t.Fatalf("ready tasks: %v", err)
+	} else if len(ready) != 0 {
+		t.Fatalf("ready = %+v, want none before release", ready)
+	}
+
+	ready, err := store.ReadyQueuedTasks(release.Add(time.Second))
+	if err != nil {
+		t.Fatalf("ready tasks after release: %v", err)
+	}
+	if len(ready) != 2 {
+		t.Fatalf("ready after release = %+v, want the two deferred tasks", ready)
+	}
+	// Same ordering rule as PendingTasks, so a spread batch dispatches in the
+	// order an operator would expect.
+	if ready[0].Task.ID != "task-high" || ready[1].Task.ID != "task-low" {
+		t.Fatalf("ready order = [%s %s], want [task-high task-low]", ready[0].Task.ID, ready[1].Task.ID)
+	}
+	// The full task and its release time must round-trip intact: the tick
+	// dispatches straight from this struct with no second query.
+	if got := ready[1]; got.Task.Command != "echo low" || got.Task.AgentID != "agent-1" || got.Task.TimeoutSecs != 5 || !got.ReleaseAt.Equal(release) {
+		t.Fatalf("deferred task did not round-trip: %+v", got)
+	}
+}
+
+// TestNextDeferredRelease pins the exact-wakeup query the release scheduler
+// depends on: it must report the soonest genuinely future deferral, drop
+// already-due tasks (returning one would arm the timer for the past and make
+// the loop spin), ignore NULL release_at, and answer "nothing scheduled" when
+// the queue holds no future work.
+func TestNextDeferredRelease(t *testing.T) {
+	store, err := NewStore(filepath.Join(t.TempDir(), "next-release.db"))
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+	defer store.Close()
+
+	now := time.Now().UTC()
+
+	// Empty queue: no scheduled work, and that is not an error.
+	if _, ok, err := store.NextDeferredRelease(now); err != nil || ok {
+		t.Fatalf("empty queue: ok=%v err=%v, want false nil", ok, err)
+	}
+
+	soon := now.Add(5 * time.Minute)
+	later := now.Add(20 * time.Minute)
+	// Adding whole minutes to the same instant keeps the sub-second part
+	// identical, so these timestamps differ only in a way string comparison
+	// orders correctly.
+	for _, task := range []protocol.Task{
+		{ID: "t-later", AgentID: "a1", Type: "shell", Command: "echo later", TimeoutSecs: 5, CreatedAt: now},
+		{ID: "t-soon", AgentID: "a1", Type: "shell", Command: "echo soon", TimeoutSecs: 5, CreatedAt: now},
+	} {
+		release := later
+		if task.ID == "t-soon" {
+			release = soon
+		}
+		if err := store.AddTask(task, release); err != nil {
+			t.Fatalf("add %s: %v", task.ID, err)
+		}
+	}
+	// An immediately-available task (NULL release_at) is not deferred, so the
+	// scheduler has nothing to wake for and must never be handed it.
+	if err := store.AddTask(protocol.Task{
+		ID: "t-now", AgentID: "a1", Type: "shell", Command: "echo now", TimeoutSecs: 5, CreatedAt: now,
+	}, time.Time{}); err != nil {
+		t.Fatalf("add immediate: %v", err)
+	}
+
+	got, ok, err := store.NextDeferredRelease(now)
+	if err != nil || !ok {
+		t.Fatalf("next deferred: ok=%v err=%v, want true nil", ok, err)
+	}
+	if !got.Equal(soon) {
+		t.Fatalf("next deferred = %v, want the earliest future deferral %v", got, soon)
+	}
+
+	// A task whose release has arrived must fall out of the query: a due task
+	// an offline agent has not taken stays queued forever, so reporting it
+	// would wake the scheduler for it again and again with no progress.
+	got, ok, err = store.NextDeferredRelease(soon)
+	if err != nil || !ok {
+		t.Fatalf("next deferred at soon: ok=%v err=%v", ok, err)
+	}
+	if !got.Equal(later) {
+		t.Fatalf("next deferred at soon = %v, want %v (the due task must be excluded)", got, later)
+	}
+
+	// Past every deferral: nothing is scheduled.
+	if _, ok, err := store.NextDeferredRelease(later); err != nil || ok {
+		t.Fatalf("next deferred past all: ok=%v err=%v, want false nil", ok, err)
+	}
+}
+
+// TestTasksMigrationAddsReleaseAt is the legacy-database guard: an old tasks
+// table has no release_at column, and after migration that must be a no-op for
+// existing rows (NULL = "release now"), not an invented deferral.
+func TestTasksMigrationAddsReleaseAt(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "tasks-legacy-release.db")
+
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open raw db: %v", err)
+	}
+	// Pre-migration shape: neither dispatched_at nor release_at exists.
+	if _, err := db.Exec(`
+		CREATE TABLE tasks (
+			id TEXT PRIMARY KEY,
+			agent_id TEXT NOT NULL,
+			type TEXT NOT NULL,
+			command TEXT NOT NULL,
+			timeout_secs INTEGER NOT NULL,
+			priority INTEGER NOT NULL DEFAULT 0,
+			created_at TEXT NOT NULL,
+			state TEXT NOT NULL
+		);`); err != nil {
+		t.Fatalf("create legacy tasks: %v", err)
+	}
+	if _, err := db.Exec(`
+		INSERT INTO tasks(id, agent_id, type, command, timeout_secs, priority, created_at, state)
+		VALUES('t-legacy', 'a1', 'shell', 'echo', 5, 0, '2024-01-01T00:00:00Z', 'queued')`); err != nil {
+		t.Fatalf("insert legacy task: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close raw db: %v", err)
+	}
+
+	store, err := NewStore(dbPath)
+	if err != nil {
+		t.Fatalf("new store (migration): %v", err)
+	}
+	defer store.Close()
+
+	// The new column defaults to NULL, so the legacy queued row stays
+	// immediately deliverable.
+	pending, err := store.PendingTasks("a1")
+	if err != nil {
+		t.Fatalf("pending tasks: %v", err)
+	}
+	if len(pending) != 1 || pending[0].ID != "t-legacy" {
+		t.Fatalf("legacy queued task should still be pending: %+v", pending)
+	}
+	// And it is deliberately invisible to the tick (release_at IS NULL).
+	if ready, err := store.ReadyQueuedTasks(time.Now().UTC()); err != nil {
+		t.Fatalf("ready tasks: %v", err)
+	} else if len(ready) != 0 {
+		t.Fatalf("NULL release_at must not be picked up by the tick: %+v", ready)
+	}
+
+	// The migrated column accepts deferred writes too.
+	if err := store.AddTask(protocol.Task{
+		ID: "t-new", AgentID: "a1", Type: "shell", Command: "echo", TimeoutSecs: 5, CreatedAt: time.Now().UTC(),
+	}, time.Now().UTC().Add(time.Hour)); err != nil {
+		t.Fatalf("add deferred task after migration: %v", err)
 	}
 }
 

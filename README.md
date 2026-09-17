@@ -34,6 +34,7 @@ export COC2_TOKEN=$(openssl rand -hex 32)
 
 **命令执行**
 - 单机 / 批量下发，目标可用 `agent_ids` / `group_ids` / `tags` 三种选择器混选
+- 批量随机错峰：批量下发时每个目标在 `[0, 窗口]` 内各自独立随机延迟（延迟落在 SQLite 里，服务重启不丢），避免整舰队在同一秒 exec；agent 在窗口内重连也不会把未到期的积压一次性吐出。批量（多目标 / `--group` / `--tag`）**默认 8s 窗口**，不必每次记得加；`--spread 0s` 恢复立即下发
 - 至多一次的派发语义 + 服务端超时回收，任务不会静默卡死（[语义细节](#任务执行语义)）
 - 取消 / 超时终止整棵进程树，不留孤儿进程
 - Agent 离线时任务排队，重连自动补发
@@ -174,6 +175,7 @@ Go 缓存默认落在仓库本地 `.gocache_local/`、`.gomodcache_local/`，可
 ./bin/coc2 agents list --online            # 在线清单
 ./bin/coc2 run --cmd "df -h" --agents web1 --wait
 ./bin/coc2 run --cmd "yum -y update" --tag env=prod --yes --wait
+./bin/coc2 run --cmd "yum -y update" --tag env=prod --yes --spread 5m --wait --wait-timeout 15m
 ./bin/coc2 run --cmd "tar czf /backup.tgz /srv" --agents web1 --priority 10 --wait
 ./bin/coc2 push --agent web1 --local ./app.bin --remote /opt/app.bin --wait
 ./bin/coc2 pull --agent web1 --remote /var/log/app.log --local ./app.log --wait
@@ -192,6 +194,7 @@ Go 缓存默认落在仓库本地 `.gocache_local/`、`.gomodcache_local/`，可
 - 全局 flag（`-server` `-token` `--pretty` `-timeout` `-insecure`）可站在命令行任意位置
 - 目标解析：`-server` / `COC2_SERVER` 给路径走 socket，给 `http(s)://` 走 TCP；token 走 `COC2_TOKEN`
 - 三个超时别混：`--exec-timeout`（任务执行秒数）· 全局 `-timeout`（HTTP 请求时长）· `--wait-timeout`（CLI 轮询预算）
+- `--spread`（批量错峰窗口，`0s`..`1h`）：给每台目标在窗口内随机化下发时刻。**未显式指定时，批量下发默认取 8s** —— 批量任务不是时效性场景，而同一瞬间打到所有机器正是要避免的；单目标 `run` 仍是立即下发，显式 `--spread 0s` 同样恢复立即下发。与 `--wait` 同用时 `--wait-timeout` 必须 ≥ `--spread` + `--exec-timeout`，否则 CLI 会在任务还在排队时就放弃轮询，故直接判为用法错误
 
 ### AI 集成
 
@@ -235,6 +238,7 @@ curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8081/api/v1/tasks   # op
 - **至多一次派发**：任务成功发送给 Agent 即标 `dispatched`，不等 `task_ack`——ack 丢失不会导致重连后重复执行。
 - **结果只认归属**：结果写入要求任务仍是非终态、且属于上报的连接身份；终态一旦落库不会被迟到或伪造的结果改写，被拒绝的结果仍记审计（`ok=false`）。
 - **回收器兜底**：`dispatched`/`cancel_requested` 超 `timeout_secs + 30s` 无结果，Server 标记 `timeout`/`canceled`。
+- **批量错峰（`--spread`）**：批量下发时每个目标随机延迟 `[0, spread]` 释放；延迟写入 `tasks.release_at`（SQLite），服务重启或 agent 重连都不会提前吐出积压，`spread_ms=0` 则与不带该参数完全一致。延迟是纯服务端概念——agent 只在任务到期后才看到它，且超时始终从 `dispatched_at`（真正下发时刻）起算，排队等待不吃任务自己的超时。下发由**精确到期唤醒**驱动（毫秒级，按最近一个 `release_at` 定时），因此短窗口也能真正铺开；1s 的扫描 tick 只作为兜底（发送失败或唤醒丢失时补发）。CLI 层：批量（fan-out）未显式指定 `--spread` 时默认 8s 窗口，单目标与显式 `0s` 均立即下发。
 - **进程组隔离**：Agent 以独立进程组执行，取消/超时终止整棵进程树。
 - **并发上限**：Agent 同时最多跑 16 个任务；超出的派发立刻以 `failed` 结果回绝，而不是静默丢弃。
 - 终态枚举：`success | failed | timeout | canceled`。

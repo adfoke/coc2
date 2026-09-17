@@ -16,6 +16,7 @@ import (
 type CmdFlags struct {
 	values map[string]any
 	args   []string
+	set    map[string]bool
 }
 
 func (f *CmdFlags) String(name string) string {
@@ -55,6 +56,13 @@ func (f *CmdFlags) List(name string) []string {
 
 // Args returns positional arguments.
 func (f *CmdFlags) Args() []string { return f.args }
+
+// Set reports whether the operator passed this flag explicitly, as opposed to
+// it merely holding its declared default. Callers need that distinction to read
+// an omitted flag differently from one deliberately set to the zero value:
+// `run` treats an absent --spread as "pick a sensible window for me" but an
+// explicit 0s as "send right now".
+func (f *CmdFlags) Set(name string) bool { return f.set[name] }
 
 // Command is one leaf subcommand.
 type Command struct {
@@ -235,7 +243,13 @@ func (r *Registry) parseCommandFlags(cmd *Command, args []string) (*CmdFlags, er
 		positional = append(positional, rest[0])
 		rest = rest[1:]
 	}
-	return &CmdFlags{values: values, args: positional}, nil
+	// Visit reports only the flags actually present on the command line, which
+	// is what lets a command tell "omitted" from "set to the default value".
+	// The FlagSet accumulates that record across the Parse calls above rather
+	// than rebuilding it, so one pass here already covers every iteration.
+	set := map[string]bool{}
+	fs.Visit(func(fl *flag.Flag) { set[fl.Name] = true })
+	return &CmdFlags{values: values, args: positional, set: set}, nil
 }
 
 // usage prints the command list; returns exit code 0.

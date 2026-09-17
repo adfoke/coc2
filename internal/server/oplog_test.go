@@ -540,7 +540,7 @@ func TestOplogSurvivesLegacyDB(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first open: %v", err)
 	}
-	if err := store.AddTask(protocol.Task{ID: "t9", AgentID: "a9", Type: "shell", Command: "echo", TimeoutSecs: 1, CreatedAt: time.Now().UTC()}); err != nil {
+	if err := store.AddTask(protocol.Task{ID: "t9", AgentID: "a9", Type: "shell", Command: "echo", TimeoutSecs: 1, CreatedAt: time.Now().UTC()}, time.Time{}); err != nil {
 		t.Fatalf("seed task: %v", err)
 	}
 	if err := store.Close(); err != nil {

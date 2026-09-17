@@ -73,6 +73,13 @@ type dispatchResponse struct {
 	QueuedOnly bool   `json:"queued_only"`
 }
 
+// defaultFanoutSpread is the stagger window `run` applies when it fans out and
+// the operator expressed no preference. Batch dispatch to a fleet is not
+// latency-sensitive — nobody is watching a hundred hosts answer in real time —
+// whereas hitting them all in the same instant is exactly the herd the server's
+// spread exists to break up. An explicit --spread 0s still means "send now".
+const defaultFanoutSpread = 8 * time.Second
+
 func addWriteCommands(r *Registry) {
 	r.Add(&Command{
 		Name:    "run",
@@ -84,6 +91,7 @@ func addWriteCommands(r *Registry) {
 			{Name: "tag", Type: "stringlist", Desc: "target tags (k or k=v)"},
 			{Name: "exec-timeout", Type: "int", Default: "60", Desc: "execution timeout in SECONDS per agent (distinct from global -timeout, which is the HTTP request duration)"},
 			{Name: "priority", Type: "int", Default: "0", Desc: "dispatch priority; higher runs first when an agent has queued work"},
+			{Name: "spread", Type: "duration", Default: "0s", Desc: "randomize dispatch times across targets within this window, so a batch does not hit every agent in the same second; a fan-out defaults to 8s, pass 0s to send immediately"},
 			{Name: "wait", Type: "bool", Desc: "block until every task reaches a terminal state"},
 			{Name: "wait-timeout", Type: "duration", Default: "90s", Desc: "CLI polling budget for --wait; must cover exec-timeout"},
 			{Name: "yes", Type: "bool", Desc: "REQUIRED whenever the selector can fan out: any --group/--tag value, or more than one --agents token"},
@@ -104,15 +112,44 @@ func addWriteCommands(r *Registry) {
 			}
 			// Fan-out needs explicit confirmation: multiple ids, or any
 			// group/tag selector whose server-side expansion is unknown here.
-			if n > 1 || len(cf.List("group")) > 0 || len(cf.List("tag")) > 0 {
-				if !cf.Bool("yes") {
-					return fail("needs_yes", "multi-agent dispatch requires --yes (explicit confirmation)", ExitUsage)
+			fanout := n > 1 || len(cf.List("group")) > 0 || len(cf.List("tag")) > 0
+			if fanout && !cf.Bool("yes") {
+				return fail("needs_yes", "multi-agent dispatch requires --yes (explicit confirmation)", ExitUsage)
+			}
+
+			// A fan-out gets a window without being asked. cf.Set is what keeps
+			// the two intents apart: an omitted --spread means "you pick", an
+			// explicit 0s means "send now" and is honoured as such.
+			spread := cf.Duration("spread")
+			if fanout && !cf.Set("spread") {
+				spread = defaultFanoutSpread
+			}
+			if spread < 0 || spread > time.Hour {
+				return fail("usage", "--spread must be between 0s and 1h", ExitUsage)
+			}
+			// A spread batch is not all dispatched at once: the last target
+			// only enters the queue up to --spread after the CLI starts its
+			// clock. If the polling budget does not also cover the execution
+			// time that follows, --wait gives up (exit 1) on tasks that are
+			// merely still queued — so reject the combination up front instead.
+			if spread > 0 && cf.Bool("wait") {
+				budget := cf.Duration("wait-timeout")
+				execTimeout := time.Duration(cf.Int("exec-timeout")) * time.Second
+				if spread+execTimeout > budget {
+					return fail("usage", fmt.Sprintf(
+						"--wait-timeout %s is too small: --spread %s + --exec-timeout %s exceeds it; raise --wait-timeout",
+						budget, spread, execTimeout), ExitUsage)
 				}
 			}
 			targets["command"] = cmd
 			targets["timeout_secs"] = cf.Int("exec-timeout")
 			if p := cf.Int("priority"); p != 0 {
 				targets["priority"] = p
+			}
+			if spread > 0 {
+				// Omitted entirely at 0, so an operator who never sets
+				// --spread sends the same body as before this flag existed.
+				targets["spread_ms"] = int(spread.Milliseconds())
 			}
 
 			var resp struct {

@@ -13,6 +13,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
 	"go.uber.org/zap"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"os"
@@ -50,6 +51,13 @@ type Service struct {
 	reaperStop chan struct{}
 	reaperDone chan struct{}
 	reaperOnce sync.Once
+
+	// releaseWake nudges reapLoop to recompute its release timer when a new
+	// deferred task lands: the fresh task may be due earlier than whatever the
+	// timer is currently aimed at. Buffered depth 1 with a non-blocking send
+	// keeps nudgeReleaseScheduler safe to call from any goroutine — a wakeup
+	// already pending makes further nudges redundant, never blocking.
+	releaseWake chan struct{}
 }
 
 // wsFrame is a transport-frame with the WebSocket opcode it must go out on:
@@ -104,7 +112,17 @@ type batchTaskRequest struct {
 	Command     string   `json:"command" binding:"required"`
 	TimeoutSecs int      `json:"timeout_secs"`
 	Priority    int      `json:"priority"`
+	// SpreadMs randomizes each target's dispatch time uniformly within
+	// [0, SpreadMs] milliseconds, so a batch does not make every agent exec in
+	// the same second. 0 keeps the historical behavior: dispatch immediately.
+	SpreadMs int `json:"spread_ms"`
 }
+
+// maxSpreadMs caps spread_ms at one hour. A larger window is not a stagger
+// anymore — it is "dispatch later", which belongs in a scheduled job, and
+// silently accepting it would let a typo (seconds vs. milliseconds) hold a
+// fleet's work for hours.
+const maxSpreadMs = 3600000
 
 type groupRequest struct {
 	ID          string   `json:"id"`
@@ -170,12 +188,13 @@ func New(cfg Config, logger *zap.Logger) (*Service, error) {
 	}
 
 	svc := &Service{
-		cfg:        cfg,
-		logger:     logger,
-		clients:    make(map[string]*agentConn),
-		transfers:  make(map[string]*transferState),
-		reaperStop: make(chan struct{}),
-		reaperDone: make(chan struct{}),
+		cfg:         cfg,
+		logger:      logger,
+		clients:     make(map[string]*agentConn),
+		transfers:   make(map[string]*transferState),
+		reaperStop:  make(chan struct{}),
+		reaperDone:  make(chan struct{}),
+		releaseWake: make(chan struct{}, 1),
 	}
 
 	store, err := NewStore(cfg.DBPath)
@@ -495,7 +514,7 @@ func (s *Service) operatorRoutes() *gin.Engine {
 			req.TimeoutSecs = 60
 		}
 
-		resp, err := s.createTask(req.AgentID, req.Command, req.TimeoutSecs, req.Priority)
+		resp, err := s.createTask(req.AgentID, req.Command, req.TimeoutSecs, req.Priority, time.Time{})
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 			return
@@ -509,6 +528,10 @@ func (s *Service) operatorRoutes() *gin.Engine {
 			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 			return
 		}
+		if req.SpreadMs < 0 || req.SpreadMs > maxSpreadMs {
+			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("spread_ms must be between 0 and %d (1 hour)", maxSpreadMs)})
+			return
+		}
 		if req.TimeoutSecs <= 0 {
 			req.TimeoutSecs = 60
 		}
@@ -519,9 +542,21 @@ func (s *Service) operatorRoutes() *gin.Engine {
 			return
 		}
 
+		// Each target draws its own offset from the same base, so the batch
+		// fans out across the window instead of marching in lockstep. A ramp
+		// (0, d, 2d, ...) would be just as uniform but trivially predictable —
+		// the point is that no one can guess when their turn comes.
+		now := time.Now().UTC()
 		results := make([]taskDispatchResponse, 0, len(targets))
 		for _, agentID := range targets {
-			resp, err := s.createTask(agentID, req.Command, req.TimeoutSecs, req.Priority)
+			// spread_ms == 0 leaves releaseAt at its zero value, which keeps
+			// the dispatch path byte-for-byte identical to before spread
+			// existed (release_at stays NULL).
+			var releaseAt time.Time
+			if req.SpreadMs > 0 {
+				releaseAt = now.Add(spreadOffset(int64(req.SpreadMs)))
+			}
+			resp, err := s.createTask(agentID, req.Command, req.TimeoutSecs, req.Priority, releaseAt)
 			if err != nil {
 				c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 				return
@@ -701,8 +736,41 @@ func (s *Service) handleAgentWS(c *gin.Context) {
 	agent.readLoop()
 }
 
-func (s *Service) dispatchOrQueue(task protocol.Task) (bool, error) {
-	if err := s.store.AddTask(task); err != nil {
+// spreadOffset samples the per-target delay for a batched dispatch: a uniform
+// draw in [0, spreadMs] milliseconds. Randomizing per target is the whole
+// point — an incrementing ramp would be just as spread out but is itself a
+// recognizable fixed pattern.
+//
+// It is a package-level var rather than a plain function so tests can swap in
+// a deterministic draw; asserting on a probability distribution would only
+// buy flakiness.
+var spreadOffset = func(spreadMs int64) time.Duration {
+	if spreadMs <= 0 {
+		return 0
+	}
+	return time.Duration(rand.Int64N(spreadMs+1)) * time.Millisecond
+}
+
+// dispatchOrQueue persists a task and, when it is due, pushes it to a live
+// agent. A releaseAt in the future defers the task instead: it is written with
+// that release time and left queued for dispatchReadyTasks to send once the
+// time arrives — whether or not the agent is connected now. Because the delay
+// lives in the row, a server restart cannot collapse a spread batch back into
+// a single burst.
+func (s *Service) dispatchOrQueue(task protocol.Task, releaseAt time.Time) (bool, error) {
+	if !releaseAt.IsZero() && releaseAt.After(time.Now().UTC()) {
+		if err := s.store.AddTask(task, releaseAt); err != nil {
+			return false, err
+		}
+		// Put the new deferral in the scheduler's view right away: without
+		// this it would only be noticed by the backstop sweep, up to a second
+		// late, or by the reconnect path. nudgeReleaseScheduler re-arms the
+		// timer so the task goes out at its exact moment.
+		s.nudgeReleaseScheduler()
+		return false, nil
+	}
+
+	if err := s.store.AddTask(task, releaseAt); err != nil {
 		return false, err
 	}
 
@@ -719,6 +787,64 @@ func (s *Service) dispatchOrQueue(task protocol.Task) (bool, error) {
 		}
 	}
 	return false, nil
+}
+
+// nudgeReleaseScheduler wakes the release timer early so it can re-aim at a
+// newly queued deferral, which may fall before the moment it is currently set
+// for. The send is non-blocking: one pending wakeup is enough to trigger a full
+// recompute, and a caller on the request path must never block on the
+// scheduler. Safe to call from any goroutine.
+func (s *Service) nudgeReleaseScheduler() {
+	select {
+	case s.releaseWake <- struct{}{}:
+	default:
+	}
+}
+
+// dispatchReadyTasks releases deferred tasks whose time has come to connected
+// agents. reapLoop calls it both from the exact release timer — the normal
+// path — and from the taskDispatchInterval backstop sweep.
+//
+// A task bound for an offline agent is left queued: PendingTasks replays it on
+// reconnect, by which point its release_at has also elapsed. Where that
+// reconnect overlaps a dispatch by a few milliseconds, both paths can hand the same
+// task to the same connection — the agent answers a retransmission from its
+// running set or result cache rather than executing it twice, so the overlap
+// costs nothing (see startTask on the agent side). A failure on one task is
+// logged and skipped: one unreachable target must not stall the rest of the
+// batch.
+func (s *Service) dispatchReadyTasks(now time.Time) {
+	ready, err := s.store.ReadyQueuedTasks(now)
+	if err != nil {
+		s.logger.Warn("scan ready tasks", zap.Error(err))
+		return
+	}
+	for _, qt := range ready {
+		if err := s.dispatchQueuedTask(qt.Task); err != nil {
+			s.logger.Warn("dispatch ready task",
+				zap.String("task_id", qt.Task.ID),
+				zap.String("agent_id", qt.Task.AgentID),
+				zap.Error(err))
+		}
+	}
+}
+
+// dispatchQueuedTask sends one due task to its agent, if that agent is
+// connected, and marks it dispatched.
+func (s *Service) dispatchQueuedTask(task protocol.Task) error {
+	s.mu.RLock()
+	client, ok := s.clients[task.AgentID]
+	s.mu.RUnlock()
+	if !ok {
+		// Offline: stay queued and let the reconnect path deliver it.
+		return nil
+	}
+	if err := client.sendTask(task); err != nil {
+		// The client may be tearing down. Leave the task queued; the next
+		// tick (or a reconnect) retries.
+		return err
+	}
+	return s.store.MarkDispatched(task.ID)
 }
 
 func (s *Service) register(client *agentConn, hello protocol.AgentHello) ([]protocol.Task, error) {
@@ -780,7 +906,10 @@ func (s *Service) unregister(client *agentConn) {
 	client.drainThenClose()
 }
 
-func (s *Service) createTask(agentID, command string, timeoutSecs, priority int) (taskDispatchResponse, error) {
+// createTask builds and dispatch-or-queues one task. A zero releaseAt means
+// "send now"; a future one defers the send (see dispatchOrQueue). The single
+// -target route always passes zero.
+func (s *Service) createTask(agentID, command string, timeoutSecs, priority int, releaseAt time.Time) (taskDispatchResponse, error) {
 	task := protocol.Task{
 		ID:          common.NewID(),
 		AgentID:     agentID,
@@ -791,7 +920,7 @@ func (s *Service) createTask(agentID, command string, timeoutSecs, priority int)
 		CreatedAt:   time.Now().UTC(),
 	}
 
-	dispatched, err := s.dispatchOrQueue(task)
+	dispatched, err := s.dispatchOrQueue(task, releaseAt)
 	if err != nil {
 		return taskDispatchResponse{}, err
 	}

@@ -125,6 +125,204 @@ func TestBatchTaskRouteTargetsByGroupIDs(t *testing.T) {
 	}
 }
 
+// postBatch fires one batch dispatch through the operator plane and decodes the
+// task list, so spread tests stay focused on behavior instead of HTTP plumbing.
+func postBatch(t *testing.T, svc *Service, body map[string]any) (int, []taskDispatchResponse, string) {
+	t.Helper()
+	raw, _ := json.Marshal(body)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/tasks/batch", bytes.NewReader(raw))
+	req.Header.Set("Content-Type", "application/json")
+	setTestAuth(req)
+	rec := httptest.NewRecorder()
+	svc.engine.ServeHTTP(rec, req)
+
+	var resp struct {
+		Count int                    `json:"count"`
+		Tasks []taskDispatchResponse `json:"tasks"`
+	}
+	if rec.Code == http.StatusAccepted {
+		if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("decode batch response: %v", err)
+		}
+	}
+	return rec.Code, resp.Tasks, rec.Body.String()
+}
+
+// TestBatchSpreadDefersEveryTarget pins the core contract of spread: with a
+// non-zero window, no target is dispatched inline — every task waits in the
+// queue for the release tick, even when its agent is already connected.
+func TestBatchSpreadDefersEveryTarget(t *testing.T) {
+	svc, cleanup := newTestService(t)
+	defer cleanup()
+
+	// Deterministic draw keeps the assertion exact instead of probabilistic.
+	origSpread := spreadOffset
+	spreadOffset = func(int64) time.Duration { return 30 * time.Second }
+	defer func() { spreadOffset = origSpread }()
+
+	// Both agents are connected: if the spread were ignored, dispatch would be
+	// immediate and each connection would see its task right away.
+	sends := map[string]chan wsFrame{}
+	for _, id := range []string{"agent-1", "agent-2"} {
+		ch := make(chan wsFrame, 4)
+		sends[id] = ch
+		svc.clients[id] = &agentConn{id: id, send: ch, done: make(chan struct{}), service: svc}
+	}
+
+	code, tasks, body := postBatch(t, svc, map[string]any{
+		"agent_ids":    []string{"agent-1", "agent-2"},
+		"command":      "echo spread",
+		"timeout_secs": 5,
+		"spread_ms":    60000,
+	})
+	if code != http.StatusAccepted {
+		t.Fatalf("status = %d body=%s", code, body)
+	}
+	if len(tasks) != 2 {
+		t.Fatalf("tasks = %+v, want 2", tasks)
+	}
+	for _, tsk := range tasks {
+		if tsk.Dispatched || !tsk.QueuedOnly {
+			t.Fatalf("spread task %s was dispatched inline: %+v", tsk.TaskID, tsk)
+		}
+		if len(sends[tsk.AgentID]) != 0 {
+			t.Fatalf("agent %s received a task during the spread window", tsk.AgentID)
+		}
+		item, ok, err := svc.store.Task(tsk.TaskID)
+		if err != nil || !ok || item.State != "queued" {
+			t.Fatalf("spread task %s state=%q ok=%v err=%v, want queued", tsk.TaskID, item.State, ok, err)
+		}
+	}
+
+	// Nothing is due before the window opens...
+	if ready, err := svc.store.ReadyQueuedTasks(time.Now().UTC()); err != nil {
+		t.Fatalf("ready tasks: %v", err)
+	} else if len(ready) != 0 {
+		t.Fatalf("tasks became due before the window opened: %+v", ready)
+	}
+
+	// ...and once the tick runs past it, each agent gets exactly its own task.
+	svc.dispatchReadyTasks(time.Now().UTC().Add(time.Minute))
+	for id, ch := range sends {
+		if len(ch) != 1 {
+			t.Fatalf("agent %s got %d frames after release, want 1", id, len(ch))
+		}
+	}
+	for _, tsk := range tasks {
+		item, ok, err := svc.store.Task(tsk.TaskID)
+		if err != nil || !ok || item.State != "dispatched" {
+			t.Fatalf("released task %s state=%q ok=%v err=%v, want dispatched", tsk.TaskID, item.State, ok, err)
+		}
+	}
+}
+
+// TestBatchSpreadZeroKeepsImmediateDispatch guards the compatibility promise:
+// omitting spread_ms (or passing 0) must behave exactly as before, dispatching
+// inline to a connected agent.
+func TestBatchSpreadZeroKeepsImmediateDispatch(t *testing.T) {
+	svc, cleanup := newTestService(t)
+	defer cleanup()
+
+	ch := make(chan wsFrame, 4)
+	svc.clients["agent-1"] = &agentConn{id: "agent-1", send: ch, done: make(chan struct{}), service: svc}
+
+	code, tasks, body := postBatch(t, svc, map[string]any{
+		"agent_ids": []string{"agent-1"},
+		"command":   "echo now",
+	})
+	if code != http.StatusAccepted {
+		t.Fatalf("status = %d body=%s", code, body)
+	}
+	if len(tasks) != 1 || !tasks[0].Dispatched || tasks[0].QueuedOnly {
+		t.Fatalf("spread_ms=0 must dispatch inline: %+v", tasks)
+	}
+	if len(ch) != 1 {
+		t.Fatalf("agent got %d frames, want 1", len(ch))
+	}
+}
+
+// TestBatchSpreadRejectsOutOfRange: a spread window outside [0, 1h] is a client
+// error and must not create any task.
+func TestBatchSpreadRejectsOutOfRange(t *testing.T) {
+	svc, cleanup := newTestService(t)
+	defer cleanup()
+
+	for _, spread := range []int{-1, maxSpreadMs + 1} {
+		code, _, body := postBatch(t, svc, map[string]any{
+			"agent_ids": []string{"agent-1"},
+			"command":   "echo",
+			"spread_ms": spread,
+		})
+		if code != http.StatusBadRequest {
+			t.Fatalf("spread_ms=%d status = %d, want 400", spread, code)
+		}
+		if !strings.Contains(body, "spread_ms") {
+			t.Fatalf("400 body must name the rejected field: %s", body)
+		}
+	}
+
+	items, err := svc.store.RecentTasks(10)
+	if err != nil {
+		t.Fatalf("recent tasks: %v", err)
+	}
+	if len(items) != 0 {
+		t.Fatalf("a rejected batch queued %d tasks", len(items))
+	}
+}
+
+// TestDeferredTaskNotInHelloPendingUntilReleased is the reconnect-side contract:
+// an agent that comes back during the spread window must not be handed tasks
+// that are not yet due — otherwise an offline fleet would receive the whole
+// backlog in one burst on reconnect, which is the herd the spread prevents.
+func TestDeferredTaskNotInHelloPendingUntilReleased(t *testing.T) {
+	svc, cleanup := newTestService(t)
+	defer cleanup()
+
+	releaseAt := time.Now().UTC().Add(10 * time.Minute)
+	task := protocol.Task{
+		ID: "task-deferred", AgentID: "agent-e2e", Type: "shell",
+		Command: "echo later", TimeoutSecs: 60, CreatedAt: time.Now().UTC(),
+	}
+	if err := svc.store.AddTask(task, releaseAt); err != nil {
+		t.Fatalf("add deferred task: %v", err)
+	}
+
+	conn, _, frame := dialAgentWS(t, svc.agentEngine, baseHello())
+	in, err := protocol.DecodeFrame(protocol.FrameText, frame)
+	if err != nil || in.MsgType != protocol.TypeHelloAck {
+		t.Fatalf("decode hello_ack: type=%q err=%v", in.MsgType, err)
+	}
+	ack, err := protocol.PayloadOf[protocol.HelloAck](in)
+	if err != nil {
+		t.Fatalf("decode hello_ack payload: %v", err)
+	}
+	if len(ack.PendingTasks) != 0 {
+		t.Fatalf("hello_ack handed out an undeferred task: %+v", ack.PendingTasks)
+	}
+
+	// Run the tick past the release window: the live connection gets it then.
+	svc.dispatchReadyTasks(releaseAt.Add(time.Second))
+
+	conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	opcode, frame, err := conn.ReadMessage()
+	if err != nil {
+		t.Fatalf("read released task: %v", err)
+	}
+	in, err = protocol.DecodeFrame(opcode, frame)
+	if err != nil || in.MsgType != protocol.TypeTaskDispatch {
+		t.Fatalf("released frame: type=%q err=%v", in.MsgType, err)
+	}
+	sent, err := protocol.PayloadOf[protocol.Task](in)
+	if err != nil || sent.ID != task.ID {
+		t.Fatalf("released task = %+v err=%v, want %s", sent, err, task.ID)
+	}
+
+	item, ok, err := svc.store.Task(task.ID)
+	if err != nil || !ok || item.State != "dispatched" {
+		t.Fatalf("released task state=%q ok=%v err=%v, want dispatched", item.State, ok, err)
+	}
+}
+
 func TestCheckOriginRejectsAllBrowserHandshakes(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "http://localhost:8080/ws/agent", nil)
 	req.Host = "localhost:8080"
@@ -204,7 +402,7 @@ func TestDispatchMarksTaskDispatchedOnSend(t *testing.T) {
 		service: svc,
 	}
 
-	resp, err := svc.createTask("agent-1", "echo ok", 5, 0)
+	resp, err := svc.createTask("agent-1", "echo ok", 5, 0, time.Time{})
 	if err != nil {
 		t.Fatalf("create task: %v", err)
 	}
@@ -229,7 +427,7 @@ func TestReapTasks(t *testing.T) {
 	past := now.Add(-time.Hour).UTC().Format(time.RFC3339Nano)
 
 	timeoutTask := protocol.Task{ID: "t-timeout", AgentID: "a1", Type: "shell", Command: "echo", TimeoutSecs: 5, CreatedAt: now}
-	if err := svc.store.AddTask(timeoutTask); err != nil {
+	if err := svc.store.AddTask(timeoutTask, time.Time{}); err != nil {
 		t.Fatalf("add timeout task: %v", err)
 	}
 	if err := svc.store.MarkDispatched(timeoutTask.ID); err != nil {
@@ -237,7 +435,7 @@ func TestReapTasks(t *testing.T) {
 	}
 
 	cancelTask := protocol.Task{ID: "t-cancel", AgentID: "a1", Type: "shell", Command: "echo", TimeoutSecs: 5, CreatedAt: now}
-	if err := svc.store.AddTask(cancelTask); err != nil {
+	if err := svc.store.AddTask(cancelTask, time.Time{}); err != nil {
 		t.Fatalf("add cancel task: %v", err)
 	}
 	if _, err := svc.store.db.Exec(`UPDATE tasks SET state = 'cancel_requested', dispatched_at = ? WHERE id = ?`, past, cancelTask.ID); err != nil {

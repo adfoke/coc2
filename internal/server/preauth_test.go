@@ -112,7 +112,7 @@ func TestPreAuthMetricsAndResultAreNotPersisted(t *testing.T) {
 	if err := svc.store.AddTask(protocol.Task{
 		ID: "task-victim", AgentID: "real-agent", Type: "shell",
 		Command: "true", TimeoutSecs: 60, CreatedAt: time.Now().UTC(),
-	}); err != nil {
+	}, time.Time{}); err != nil {
 		t.Fatalf("add task: %v", err)
 	}
 
@@ -192,7 +192,7 @@ func TestAuthenticatedResultForOwnTaskIsApplied(t *testing.T) {
 		ID: "task-legit", AgentID: "agent-e2e", Type: "shell",
 		Command: "true", TimeoutSecs: 60, CreatedAt: time.Now().UTC(),
 	}
-	if err := svc.store.AddTask(task); err != nil {
+	if err := svc.store.AddTask(task, time.Time{}); err != nil {
 		t.Fatalf("add task: %v", err)
 	}
 	if err := svc.store.MarkDispatched(task.ID); err != nil {
@@ -244,7 +244,7 @@ func TestSaveResultRejectsForeignAndTerminalWrites(t *testing.T) {
 	if err := store.AddTask(protocol.Task{
 		ID: "t-own", AgentID: "owner", Type: "shell", Command: "true",
 		TimeoutSecs: 5, CreatedAt: time.Now().UTC(),
-	}); err != nil {
+	}, time.Time{}); err != nil {
 		t.Fatalf("add task: %v", err)
 	}
 

@@ -146,7 +146,8 @@ func (s *Store) init() error {
 			priority INTEGER NOT NULL DEFAULT 0,
 			created_at TEXT NOT NULL,
 			state TEXT NOT NULL,
-			dispatched_at TEXT
+			dispatched_at TEXT,
+			release_at TEXT
 		);`,
 		`CREATE TABLE IF NOT EXISTS task_results (
 			task_id TEXT PRIMARY KEY,
@@ -286,9 +287,15 @@ func (s *Store) migrateAgentMetrics() error {
 	return err
 }
 
-// migrateTasks adds the dispatched_at column to legacy databases and backfills
-// it for any tasks that were already dispatched under the old schema, so the
-// task reaper has a timestamp to work from.
+// migrateTasks adds the dispatched_at and release_at columns to legacy
+// databases and backfills dispatched_at for any tasks that were already
+// dispatched under the old schema, so the task reaper has a timestamp to work
+// from.
+//
+// release_at is deliberately NOT backfilled: NULL means "released
+// immediately", which is exactly how every pre-existing row behaved. Writing a
+// timestamp there would invent a release window that never existed and hold
+// old queued work back for no reason.
 func (s *Store) migrateTasks() error {
 	has, err := s.tableHasColumn("tasks", "dispatched_at")
 	if err != nil {
@@ -300,10 +307,30 @@ func (s *Store) migrateTasks() error {
 		}
 	}
 
-	_, err = s.db.Exec(`
+	hasRelease, err := s.tableHasColumn("tasks", "release_at")
+	if err != nil {
+		return err
+	}
+	if !hasRelease {
+		if _, err := s.db.Exec(`ALTER TABLE tasks ADD COLUMN release_at TEXT`); err != nil {
+			return err
+		}
+	}
+
+	if _, err := s.db.Exec(`
 		UPDATE tasks SET dispatched_at = created_at
 		WHERE state IN ('dispatched', 'cancel_requested') AND dispatched_at IS NULL
-	`)
+	`); err != nil {
+		return err
+	}
+
+	// The release scheduler queries by state plus release_at on every wakeup,
+	// which the agent-first index above cannot serve. This has to come after
+	// the ALTER that adds release_at: on a legacy database the column does not
+	// exist yet, so creating the index earlier (alongside the other init
+	// indexes) would fail the whole migration. IF NOT EXISTS keeps it
+	// idempotent across restarts.
+	_, err = s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_tasks_state_release ON tasks(state, release_at);`)
 	return err
 }
 
@@ -437,10 +464,17 @@ func (s *Store) Agents() ([]AgentState, error) {
 	return items, rows.Err()
 }
 
-func (s *Store) AddTask(task protocol.Task) error {
+// AddTask inserts a task, or resets an existing one to 'queued'. releaseAt
+// optionally defers the task: a non-zero value records when it may leave the
+// queue, and NULL (zero releaseAt) means "available right now". The value is
+// server-side bookkeeping only — it never reaches an agent, which only ever
+// sees tasks that are already due. Keeping it in the row (rather than in
+// memory) is what lets a spread batch survive a server restart with its
+// stagger intact.
+func (s *Store) AddTask(task protocol.Task, releaseAt time.Time) error {
 	_, err := s.db.Exec(`
-		INSERT INTO tasks(id, agent_id, type, command, timeout_secs, priority, created_at, state)
-		VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO tasks(id, agent_id, type, command, timeout_secs, priority, created_at, state, release_at)
+		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			agent_id = excluded.agent_id,
 			type = excluded.type,
@@ -449,18 +483,26 @@ func (s *Store) AddTask(task protocol.Task) error {
 			priority = excluded.priority,
 			created_at = excluded.created_at,
 			state = excluded.state,
+			release_at = excluded.release_at,
 			dispatched_at = NULL
-	`, task.ID, task.AgentID, task.Type, task.Command, task.TimeoutSecs, task.Priority, task.CreatedAt.UTC().Format(time.RFC3339Nano), "queued")
+	`, task.ID, task.AgentID, task.Type, task.Command, task.TimeoutSecs, task.Priority, task.CreatedAt.UTC().Format(time.RFC3339Nano), "queued", formatNullTime(releaseAt))
 	return err
 }
 
+// PendingTasks returns the queued work an agent may receive right now. Tasks
+// scheduled for a later release_at are excluded: a task deferred by a batch
+// spread must not be flushed early just because the agent happened to
+// reconnect, or an agent that was offline during the window would receive the
+// whole backlog in one burst — the same thundering herd the spread exists to
+// prevent, just relocated to the reconnect path.
 func (s *Store) PendingTasks(agentID string) ([]protocol.Task, error) {
 	rows, err := s.db.Query(`
 			SELECT id, agent_id, type, command, timeout_secs, priority, created_at
 			FROM tasks
 			WHERE agent_id = ? AND state = 'queued'
+			  AND (release_at IS NULL OR release_at <= ?)
 			ORDER BY priority DESC, created_at ASC
-		`, agentID)
+		`, agentID, time.Now().UTC().Format(time.RFC3339Nano))
 	if err != nil {
 		return nil, err
 	}
@@ -479,6 +521,82 @@ func (s *Store) PendingTasks(agentID string) ([]protocol.Task, error) {
 		items = append(items, item)
 	}
 	return items, rows.Err()
+}
+
+// queuedTask is a queued task whose release window has opened, carrying the
+// full protocol.Task so the dispatch tick can send it without a second query.
+type queuedTask struct {
+	Task      protocol.Task
+	ReleaseAt time.Time
+}
+
+// ReadyQueuedTasks returns queued tasks whose release_at has passed, in
+// dispatch order (priority DESC, then FIFO). Only deferred tasks are returned:
+// a NULL release_at means the task was already dispatched inline by
+// dispatchOrQueue, so the tick must not pick it up again. This is the
+// connected-agent counterpart to PendingTasks, which covers the reconnect path.
+func (s *Store) ReadyQueuedTasks(now time.Time) ([]queuedTask, error) {
+	rows, err := s.db.Query(`
+		SELECT id, agent_id, type, command, timeout_secs, priority, created_at, COALESCE(release_at, '')
+		FROM tasks
+		WHERE state = 'queued' AND release_at IS NOT NULL AND release_at <= ?
+		ORDER BY priority DESC, created_at ASC
+	`, now.UTC().Format(time.RFC3339Nano))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var items []queuedTask
+	for rows.Next() {
+		var (
+			item       queuedTask
+			createdRaw string
+			releaseRaw string
+		)
+		if err := rows.Scan(&item.Task.ID, &item.Task.AgentID, &item.Task.Type, &item.Task.Command, &item.Task.TimeoutSecs, &item.Task.Priority, &createdRaw, &releaseRaw); err != nil {
+			return nil, err
+		}
+		item.Task.CreatedAt = parseNullTime(createdRaw)
+		item.ReleaseAt = parseNullTime(releaseRaw)
+		items = append(items, item)
+	}
+	return items, rows.Err()
+}
+
+// NextDeferredRelease returns the earliest release_at strictly after now among
+// queued tasks, i.e. the next moment the release scheduler has work to do. It
+// is the exact-wakeup counterpart to ReadyQueuedTasks: instead of waking every
+// tick to ask "is anything due", the scheduler sleeps until this instant.
+//
+// Already-due tasks (release_at <= now) are deliberately excluded. A task that
+// is due but whose agent is offline stays queued — dispatchQueuedTask only
+// marks it dispatched on a live connection — so returning it here would wake
+// the scheduler again immediately, forever: a busy loop with no progress.
+// Those tasks are instead replayed by PendingTasks when the agent reconnects,
+// which is a path the scheduler neither needs nor should duplicate.
+//
+// The comparison is a string compare on RFC3339Nano, the exact form AddTask
+// writes; a time.Time argument would be persisted by modernc/sqlite with a
+// space separator, which sorts below every "T" timestamp and would silently
+// return the wrong row.
+func (s *Store) NextDeferredRelease(now time.Time) (time.Time, bool, error) {
+	var raw sql.NullString
+	err := s.db.QueryRow(`
+		SELECT MIN(release_at) FROM tasks
+		WHERE state = 'queued' AND release_at IS NOT NULL AND release_at > ?
+	`, now.UTC().Format(time.RFC3339Nano)).Scan(&raw)
+	if err != nil {
+		return time.Time{}, false, err
+	}
+	if !raw.Valid || raw.String == "" {
+		return time.Time{}, false, nil
+	}
+	next, err := time.Parse(time.RFC3339Nano, raw.String)
+	if err != nil {
+		return time.Time{}, false, fmt.Errorf("parse next release_at: %w", err)
+	}
+	return next, true, nil
 }
 
 func (s *Store) MarkDispatched(taskID string) error {

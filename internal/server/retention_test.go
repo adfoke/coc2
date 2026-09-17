@@ -25,7 +25,7 @@ func seedHistory(t *testing.T, store *Store, old time.Time) {
 	t.Helper()
 
 	// Old terminal task + result.
-	if err := store.AddTask(protocol.Task{ID: "old-task", AgentID: "a1", Type: "shell", Command: "echo", TimeoutSecs: 5, CreatedAt: old}); err != nil {
+	if err := store.AddTask(protocol.Task{ID: "old-task", AgentID: "a1", Type: "shell", Command: "echo", TimeoutSecs: 5, CreatedAt: old}, time.Time{}); err != nil {
 		t.Fatalf("seed old task: %v", err)
 	}
 	if _, err := store.SaveResult(protocol.TaskResult{TaskID: "old-task", AgentID: "a1", Status: "success", CompletedAt: old}); err != nil {
@@ -54,7 +54,7 @@ func TestPruneAuditsDeletesOldKeepsNew(t *testing.T) {
 	seedHistory(t, store, old)
 
 	// Fresh counterparts that must survive.
-	if err := store.AddTask(protocol.Task{ID: "new-task", AgentID: "a1", Type: "shell", Command: "echo", TimeoutSecs: 5, CreatedAt: now}); err != nil {
+	if err := store.AddTask(protocol.Task{ID: "new-task", AgentID: "a1", Type: "shell", Command: "echo", TimeoutSecs: 5, CreatedAt: now}, time.Time{}); err != nil {
 		t.Fatalf("seed new task: %v", err)
 	}
 	if _, err := store.SaveResult(protocol.TaskResult{TaskID: "new-task", AgentID: "a1", Status: "success", CompletedAt: now}); err != nil {
@@ -107,10 +107,10 @@ func TestPruneAuditsNeverTouchesLiveTasks(t *testing.T) {
 	ancient := now.AddDate(0, 0, -4000)
 
 	// A queued task and a dispatched task, both far past any retention.
-	if err := store.AddTask(protocol.Task{ID: "queued-forever", AgentID: "a1", Type: "shell", Command: "echo", TimeoutSecs: 5, CreatedAt: ancient}); err != nil {
+	if err := store.AddTask(protocol.Task{ID: "queued-forever", AgentID: "a1", Type: "shell", Command: "echo", TimeoutSecs: 5, CreatedAt: ancient}, time.Time{}); err != nil {
 		t.Fatalf("seed queued: %v", err)
 	}
-	if err := store.AddTask(protocol.Task{ID: "dispatched-forever", AgentID: "a1", Type: "shell", Command: "echo", TimeoutSecs: 5, CreatedAt: ancient}); err != nil {
+	if err := store.AddTask(protocol.Task{ID: "dispatched-forever", AgentID: "a1", Type: "shell", Command: "echo", TimeoutSecs: 5, CreatedAt: ancient}, time.Time{}); err != nil {
 		t.Fatalf("seed dispatched: %v", err)
 	}
 	if err := store.MarkDispatched("dispatched-forever"); err != nil {
@@ -145,7 +145,7 @@ func TestPruneAuditsSweepsOrphanResults(t *testing.T) {
 	now := time.Now().UTC()
 	old := now.AddDate(0, 0, -400)
 
-	if err := store.AddTask(protocol.Task{ID: "orphan-task", AgentID: "a1", Type: "shell", Command: "echo", TimeoutSecs: 5, CreatedAt: old}); err != nil {
+	if err := store.AddTask(protocol.Task{ID: "orphan-task", AgentID: "a1", Type: "shell", Command: "echo", TimeoutSecs: 5, CreatedAt: old}, time.Time{}); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 	if _, err := store.SaveResult(protocol.TaskResult{TaskID: "orphan-task", AgentID: "a1", Status: "success", CompletedAt: old}); err != nil {
