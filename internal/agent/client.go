@@ -29,22 +29,20 @@ import (
 )
 
 const (
-	maxTaskOutputBytes = 1 << 20
-	maxCachedResults   = 256
-	cachedResultTTL    = 10 * time.Minute
+	// maxTaskOutputBytes and maxConcurrentTasks are the operator-visible task
+	// limits; they live in internal/common because `coc2 schema` publishes
+	// them, and the published number must be the enforced one.
+	maxTaskOutputBytes = common.MaxTaskOutputBytes
+	maxConcurrentTasks = common.MaxConcurrentTasks
+
+	maxCachedResults = 256
+	cachedResultTTL  = 10 * time.Minute
 
 	// maxInboundFrameBytes bounds a single frame from the server. The server
 	// already caps what it sends; this is the agent's own defence so a
 	// hostile or buggy peer cannot make it allocate without limit. It matches
 	// the server's own SetReadLimit.
 	maxInboundFrameBytes = 16 << 20
-
-	// maxConcurrentTasks bounds how many shell tasks run at once. Every task
-	// is a process group plus up to 2 MiB of captured output, so without a
-	// cap a burst of dispatches (or a compromised server) could exhaust the
-	// agent host. Excess dispatches are answered with a failed result rather
-	// than silently dropped, so the operator sees why nothing ran.
-	maxConcurrentTasks = 16
 
 	// agentWriteTimeout bounds one websocket write. Generous enough for a
 	// 256 KiB chunk over a slow link, short enough that a dead peer cannot
@@ -690,6 +688,18 @@ func (c *Client) beginUpload(conn *websocket.Conn, start protocol.FileTransferSt
 			CompletedAt: time.Now().UTC(),
 		})
 		return
+	}
+	// A resumed upload is the one transfer fact the audit trail cannot show by
+	// itself: the transfer record looks the same whether the bytes came from
+	// the start or from a retained .part, so say so when it happens. Only the
+	// failure to *announce* a resume was logged before, which left a successful
+	// resume indistinguishable from a full re-send.
+	if offset > 0 {
+		c.logger.Info("resuming partial upload",
+			zap.String("transfer_id", start.TransferID),
+			zap.String("remote_path", start.RemotePath),
+			zap.Int64("offset", offset),
+			zap.Int64("size", start.Size))
 	}
 
 	file, err := common.OpenPartialFile(tempPath, offset)

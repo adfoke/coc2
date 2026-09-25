@@ -52,7 +52,7 @@ export COC2_TOKEN=$(openssl rand -hex 32)
 
 **平台**
 - SQLite 持久化（Agent、任务、分组、指标、传输审计、操作日志）
-- 操作审计（`oplog`）：每条写操作记录谁（UDS 内核凭据 uid→用户名 / TCP token 身份）、从哪（peer pid / socket / IP）、做了什么、结果如何；认证失败同样落库。Agent 面不只记失败——已认证 agent 的连接、任务结果、传输终态也各落一行（含结果是否被采纳），所以"真 agent 干的"和"伪造的"事后可区分；`coc2 audit list` 查询
+- 操作审计（`oplog`）：每条写操作记录谁（UDS 内核凭据 uid→用户名 / TCP token 身份）、从哪（peer pid / socket / IP）、做了什么、结果如何；认证失败同样落库。Agent 面不只记失败——已认证 agent 的**连接、断开、任务结果、传输终态**也各落一行（含结果是否被采纳），所以"真 agent 干的"和"伪造的"事后可区分。断开行带会话时长，并区分"会话结束"与"被新连接顶替"（重连时旧会话结束但 agent 仍在线）；`coc2 audit list` 查询
 - 基础监控上报 + 指标历史（每 Agent 最近 1000 条）
 - 运行日志可落盘并按大小轮转（`log_file` / `log_level` / `log_max_*`，默认 stderr）；审计历史保留可配（`audit_retention_days`，默认 **14 天**，设为 `0` 则永久保留）
 - 本地可执行文件插件钩子（[plugins/README.md](plugins/README.md)）
@@ -142,7 +142,7 @@ Go 缓存默认落在仓库本地 `.gocache_local/`、`.gomodcache_local/`，可
 | `-config` | — | `config.yaml` | 配置文件路径 |
 | `-listen` | `listen` | `:8080` | Agent 面地址 |
 | `-operator-uds` | `operator_uds` | `./coc2.sock` | Operator 面 socket（空值需配合 `-operator-listen`） |
-| `-operator-listen` | `operator_listen` | 空 | Operator 面 TCP 逃生门（启用即强制 token） |
+| `-operator-listen` | `operator_listen` | 空 | Operator 面 TCP 逃生门。启用后**整条 Operator 面**（含本地 socket）都要求 token——判定是 `OperatorListen != "" \|\| OperatorUDSPath == ""`，不是按连接来源分的 |
 | `-token` | `token` | — | Agent hello 共享 token（生产必换，`openssl rand -hex 32`）；仍为内置开发值时拒绝启动 |
 | `-api-token` | `api_token` | 同 `-token` | Operator 面 TCP 的 token |
 | `-allow-dev-token` | `allow_dev_token` | `false` | 允许用内置开发 token 启动（仅限本地一次性运行） |
@@ -223,6 +223,8 @@ curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8081/api/v1/tasks   # op
 
 `proto/coc2/v1/wire.proto` 是单一事实源，生成码入库。帧自描述：WebSocket text 帧 = 旧 JSON 信封，binary 帧 = protobuf `WireEnvelope`；Agent 在 hello 里声明 `proto_version`，Server 决定升档与否，混跑兼容。二进制帧下文件 chunk 走裸 bytes（JSON 路径的 base64 膨胀 -33%），且 `stdout`/`stderr`/`command` 为 bytes 字段——非 UTF-8 输出不再被静默损坏。改 `.proto` 后 `make proto` 重生成并保证对拍测试绿。
 
+**非 UTF-8 的保真边界**（protobuf 路径）：原始字节从 Agent 到 Server 到 SQLite 全程不损坏（`SELECT CAST(stdout AS BLOB)` 能读回原字节），**损失只发生在 CLI 把结果序列化成 JSON 的那一刻**——JSON 字符串承载不了任意字节，于是变成 U+FFFD 替换符。也就是说：`coc2` CLI 输出里看到替换符 ≠ 数据在链路或存储里被损坏；要拿原始字节就从 API/DB 取。
+
 ## 安全
 
 - **双平面隔离**：Agent 面只有 WS 升级与探针；全部管理 API 只在 Operator 面。
@@ -250,6 +252,11 @@ Server 加载 `-plugins` 目录下可执行文件，事件 JSON 从 stdin 传入
 ## 已知限制
 
 - 命令执行 = `/bin/sh -c`，无 Windows 原生支持
+- **任务输出有上限**：stdout / stderr **各**封顶 1 MiB；超出部分丢弃，并在末尾追加一行 `[output truncated]`。
+  看到这行就是被截断了，没看到就是完整的。数值由 `internal/common.MaxTaskOutputBytes` 定义，
+  `coc2 schema` 的 `limits.task_output_bytes_per_stream` 报的是同一个常量（`limits` 里还有并发上限等）
+- **单 Agent 并发上限 16**：超出的派发立刻回一个 `failed` 结果（`agent is already running the maximum
+  number of tasks`），不会静默丢弃
 - 监控为基础指标（无 CPU/内存占用率、无进程级），历史每 Agent 封顶 1000 条
 - 插件是本地可执行文件钩子，无沙箱隔离、无热重载
 - 传输失败保留 `.part` 供续传（同一目标路径视为同一任务）

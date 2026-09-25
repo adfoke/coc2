@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -50,10 +51,68 @@ type Client struct {
 	token    string
 	timeout  time.Duration
 	insecure bool
+	// TLS material for the operator plane. A server started with client_ca
+	// requires a client certificate on every operator connection, including
+	// the TCP escape hatch, and without these flags the CLI simply could not
+	// reach such a server over TCP at all — leaving the local socket as the
+	// only option.
+	caCert     string
+	clientCert string
+	clientKey  string
 }
 
-func NewClient(target, token string, timeout time.Duration, insecure bool) *Client {
-	return &Client{target: target, token: token, timeout: timeout, insecure: insecure}
+// TLSFiles names the optional certificate material for the operator plane.
+type TLSFiles struct {
+	CACert     string
+	ClientCert string
+	ClientKey  string
+}
+
+func NewClient(target, token string, timeout time.Duration, insecure bool, tlsFiles TLSFiles) *Client {
+	return &Client{
+		target:     target,
+		token:      token,
+		timeout:    timeout,
+		insecure:   insecure,
+		caCert:     tlsFiles.CACert,
+		clientCert: tlsFiles.ClientCert,
+		clientKey:  tlsFiles.ClientKey,
+	}
+}
+
+// tlsClientConfig assembles the operator-plane TLS configuration, or nil when
+// no material was supplied (then Go's defaults apply).
+func (c *Client) tlsClientConfig() (*tls.Config, error) {
+	if c.caCert == "" && c.clientCert == "" && c.clientKey == "" {
+		return nil, nil
+	}
+
+	cfg := &tls.Config{}
+	if c.insecure {
+		cfg.InsecureSkipVerify = true
+	}
+	if c.caCert != "" {
+		pem, err := os.ReadFile(c.caCert)
+		if err != nil {
+			return nil, fail("config", fmt.Sprintf("read -ca-cert: %v", err), ExitUsage)
+		}
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(pem) {
+			return nil, fail("config", "-ca-cert contains no PEM certificate", ExitUsage)
+		}
+		cfg.RootCAs = pool
+	}
+	if c.clientCert != "" || c.clientKey != "" {
+		if c.clientCert == "" || c.clientKey == "" {
+			return nil, fail("config", "-client-cert and -client-key must be given together", ExitUsage)
+		}
+		cert, err := tls.LoadX509KeyPair(c.clientCert, c.clientKey)
+		if err != nil {
+			return nil, fail("config", fmt.Sprintf("load client certificate: %v", err), ExitUsage)
+		}
+		cfg.Certificates = []tls.Certificate{cert}
+	}
+	return cfg, nil
 }
 
 // IsUDS reports whether the target is a Unix socket path rather than a URL.
@@ -86,11 +145,20 @@ func (c *Client) httpClient() (*http.Client, string, error) {
 		}, "http://unix", nil
 	}
 
-	if strings.HasPrefix(base, "https://") && c.insecure {
-		return &http.Client{
-			Timeout:   c.timeout,
-			Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}},
-		}, strings.TrimRight(base, "/"), nil
+	tlsCfg, err := c.tlsClientConfig()
+	if err != nil {
+		return nil, "", err
+	}
+	if strings.HasPrefix(base, "https://") {
+		if tlsCfg == nil && c.insecure {
+			tlsCfg = &tls.Config{InsecureSkipVerify: true}
+		}
+		if tlsCfg != nil {
+			return &http.Client{
+				Timeout:   c.timeout,
+				Transport: &http.Transport{TLSClientConfig: tlsCfg},
+			}, strings.TrimRight(base, "/"), nil
+		}
 	}
 	return &http.Client{Timeout: c.timeout}, strings.TrimRight(base, "/"), nil
 }

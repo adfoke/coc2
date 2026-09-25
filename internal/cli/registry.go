@@ -9,6 +9,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"coc2/internal/common"
 )
 
 // CmdFlags gives commands typed access to their parsed flags plus the
@@ -90,6 +92,11 @@ type Globals struct {
 	Server   string
 	Token    string
 	Insecure bool
+	// Client-side TLS material for the operator plane, needed when the server
+	// runs with client_ca (mTLS).
+	CACert     string
+	ClientCert string
+	ClientKey  string
 }
 
 // Registry owns all commands.
@@ -168,7 +175,11 @@ func (r *Registry) RunWithIO(args []string, stdout, stderr io.Writer) int {
 		return ExitUsage
 	}
 
-	g.Client = NewClient(g.Server, g.Token, g.Timeout, g.Insecure)
+	g.Client = NewClient(g.Server, g.Token, g.Timeout, g.Insecure, TLSFiles{
+		CACert:     g.CACert,
+		ClientCert: g.ClientCert,
+		ClientKey:  g.ClientKey,
+	})
 	if err := cmd.Run(g, cf); err != nil {
 		EmitError(g.Stderr, err)
 		return ExitCode(err)
@@ -185,6 +196,9 @@ func (r *Registry) parseGlobals(g *Globals, args []string) error {
 	fs.BoolVar(&g.Pretty, "pretty", false, "indent JSON output")
 	fs.DurationVar(&g.Timeout, "timeout", 30*time.Second, "HTTP request timeout")
 	fs.BoolVar(&g.Insecure, "insecure", false, "skip TLS verification (https targets)")
+	fs.StringVar(&g.CACert, "ca-cert", "", "CA bundle to verify the operator plane's TLS certificate")
+	fs.StringVar(&g.ClientCert, "client-cert", "", "client certificate for a server running with client_ca (mTLS)")
+	fs.StringVar(&g.ClientKey, "client-key", "", "private key for -client-cert")
 	if err := fs.Parse(args); err != nil {
 		return fail("usage", err.Error(), ExitUsage)
 	}
@@ -275,6 +289,7 @@ func (r *Registry) emitSchema(g *Globals) int {
 		Name        string         `json:"name"`
 		Version     string         `json:"version"`
 		ExitCodes   map[string]int `json:"exit_codes"`
+		Limits      map[string]any `json:"limits"`
 		GlobalFlags []FlagSpec     `json:"global_flags"`
 		Commands    []*Command     `json:"commands"`
 	}
@@ -285,12 +300,30 @@ func (r *Registry) emitSchema(g *Globals) int {
 			"ok": ExitOK, "failure": ExitFailure, "connect": ExitConnect,
 			"auth": ExitAuth, "usage": ExitUsage,
 		},
+		// Limits a programmatic caller has to know to interpret results
+		// correctly. A truncated result that looks complete is worse than an
+		// error: an agent that reads only this schema must be able to tell
+		// "the command printed one line" from "the command printed more than
+		// we kept".
+		Limits: map[string]any{
+			"task_output_bytes_per_stream":  common.MaxTaskOutputBytes,
+			"task_output_truncation_marker": "[output truncated]",
+			"task_output_note": "stdout and stderr are each capped at task_output_bytes_per_stream; " +
+				"when a stream exceeds it the tail is dropped and a line containing " +
+				"task_output_truncation_marker is appended",
+			"concurrent_tasks_per_agent": common.MaxConcurrentTasks,
+			"concurrent_tasks_note": "dispatches beyond this are answered with a failed result " +
+				"(\"agent is already running the maximum number of tasks\"), never silently dropped",
+		},
 		GlobalFlags: []FlagSpec{
 			{Name: "server", Type: "string", Default: DefaultTarget(), Desc: "operator plane unix socket path or http(s) URL; env COC2_SERVER"},
 			{Name: "token", Type: "string", Desc: "bearer token for the TCP operator plane; env COC2_TOKEN"},
 			{Name: "pretty", Type: "bool", Desc: "indent JSON"},
 			{Name: "timeout", Type: "duration", Default: "30s", Desc: "HTTP timeout"},
 			{Name: "insecure", Type: "bool", Desc: "skip TLS verification"},
+			{Name: "ca-cert", Type: "string", Desc: "CA bundle to verify the operator plane's TLS certificate"},
+			{Name: "client-cert", Type: "string", Desc: "client certificate for a server running with client_ca (mTLS)"},
+			{Name: "client-key", Type: "string", Desc: "private key for -client-cert"},
 		},
 		Commands: r.cmds,
 	}
@@ -336,7 +369,10 @@ func hoistGlobals(args []string) (rest []string, globals []string) {
 	return
 }
 
-var globalFlags = map[string]bool{"server": true, "token": true, "pretty": true, "timeout": true, "insecure": true}
+var globalFlags = map[string]bool{
+	"server": true, "token": true, "pretty": true, "timeout": true, "insecure": true,
+	"ca-cert": true, "client-cert": true, "client-key": true,
+}
 
 func isGlobalFlag(key string) bool { return globalFlags[key] }
 
