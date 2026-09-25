@@ -273,7 +273,7 @@ func (s *Service) logAgentAuthFailure(remoteAddr, claimedAgentID string) {
 // agentEvent says what an authenticated agent reported and what the server did
 // with it.
 type agentEvent struct {
-	Kind    string // connect | task_result | transfer_done | metrics_report
+	Kind    string // connect | disconnect | task_result | transfer_done | metrics_report
 	AgentID string
 	OK      bool
 	Status  int

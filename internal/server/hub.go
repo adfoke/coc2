@@ -93,6 +93,11 @@ type agentConn struct {
 	// authentications before any agent identity exists.
 	remoteAddr string
 
+	// registeredAt is when this session was accepted. The disconnect audit
+	// row reports the session length, which is the one thing the connect row
+	// and the current online flag cannot tell you after the fact.
+	registeredAt time.Time
+
 	// binaryOut flips to true once the hello exchange proves the peer
 	// speaks protobuf; reads always accept both framings by opcode.
 	binaryOut atomic.Bool
@@ -850,6 +855,7 @@ func (s *Service) dispatchQueuedTask(task protocol.Task) error {
 func (s *Service) register(client *agentConn, hello protocol.AgentHello) ([]protocol.Task, error) {
 	client.id = hello.AgentID
 	client.meta = hello
+	client.registeredAt = time.Now().UTC()
 
 	s.mu.Lock()
 	old := s.clients[hello.AgentID]
@@ -898,12 +904,47 @@ func (s *Service) unregister(client *agentConn) {
 	if current := s.clients[client.id]; current == client {
 		delete(s.clients, client.id)
 	}
+	// A different session may already hold this agent id: register() retires
+	// the previous connection for an id, so a reconnect lands here with the
+	// replacement already in the map. That agent is online, not gone — this
+	// teardown must not clear the live session's flag.
+	superseded := s.clients[client.id] != nil
 	s.mu.Unlock()
 
-	if err := s.store.SetAgentOnline(client.id, false, time.Now().UTC()); err != nil {
-		s.logger.Warn("set agent offline", zap.String("agent_id", client.id), zap.Error(err))
+	now := time.Now().UTC()
+	if !superseded {
+		if err := s.store.SetAgentOnline(client.id, false, now); err != nil {
+			s.logger.Warn("set agent offline", zap.String("agent_id", client.id), zap.Error(err))
+		}
 	}
+
+	// Record the session ending. The online flag alone cannot answer "when did
+	// this agent go away", and the connect row alone cannot tell a real
+	// disconnect from a reconnect that replaced the socket.
+	summary := "session ended"
+	if superseded {
+		summary = "session superseded by a newer connection"
+	}
+	if !client.registeredAt.IsZero() {
+		summary = fmt.Sprintf("%s (session %s)", summary, formatSessionLength(now.Sub(client.registeredAt)))
+	}
+	s.auditAgentEvent(client, agentEvent{
+		Kind:    "disconnect",
+		AgentID: client.id,
+		OK:      true,
+		Summary: summary,
+	})
+
 	client.drainThenClose()
+}
+
+// formatSessionLength renders a session duration compactly for the audit row,
+// rounded to the second: this is evidence, not a benchmark.
+func formatSessionLength(d time.Duration) string {
+	if d < 0 {
+		d = 0
+	}
+	return d.Round(time.Second).String()
 }
 
 // createTask builds and dispatch-or-queues one task. A zero releaseAt means
