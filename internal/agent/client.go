@@ -50,6 +50,14 @@ const (
 	// 256 KiB chunk over a slow link, short enough that a dead peer cannot
 	// hold writeMu indefinitely.
 	agentWriteTimeout = 30 * time.Second
+
+	// shutdownGrace bounds how long Run waits for in-flight tasks to tear
+	// their process groups down once the context is cancelled. Those tasks
+	// derive from the same context, so cancelling has already asked them to
+	// kill; the wait only covers delivering the signal. Exiting the process
+	// first would orphan their children, which is exactly what the
+	// process-group kill exists to prevent.
+	shutdownGrace = 5 * time.Second
 )
 
 // errTooManyTasks is reported back for a dispatch that arrived while
@@ -67,9 +75,12 @@ type Client struct {
 	// binaryOut flips once hello_ack arrives as a binary frame, proving the
 	// server completed the protobuf negotiation; every message after it is
 	// sent protobuf-encoded. Reads always accept both framings by opcode.
-	binaryOut  atomic.Bool
-	taskMu     sync.Mutex
-	running    map[string]context.CancelFunc
+	binaryOut atomic.Bool
+	taskMu    sync.Mutex
+	running   map[string]context.CancelFunc
+	// taskWG tracks the task goroutines so shutdown can wait for them to
+	// finish killing their process groups instead of exiting on top of them.
+	taskWG     sync.WaitGroup
 	resultMu   sync.Mutex
 	results    map[string]cachedTaskResult
 	uploadMu   sync.Mutex
@@ -162,6 +173,9 @@ func (c *Client) Run(ctx context.Context) error {
 
 		err := c.runOnce(ctx)
 		if ctx.Err() != nil {
+			// Shutting down: let the task goroutines finish killing their
+			// process groups before this process disappears from under them.
+			c.waitRunningTasks(shutdownGrace)
 			return ctx.Err()
 		}
 		if err != nil {
@@ -196,6 +210,22 @@ func (c *Client) runOnce(ctx context.Context) error {
 	// the client does not answer the server's pings, and liveness is already
 	// covered by the heartbeat write failing on a dead link.)
 	conn.SetReadLimit(maxInboundFrameBytes)
+
+	// ...which means the read loop below blocks indefinitely on a healthy
+	// connection and never observes ctx being cancelled. Without this watcher
+	// a SIGTERM (systemd stop, docker stop, `kill`) would leave the agent
+	// running, still heartbeating and still counted online by the server,
+	// while every task dispatched to it died as "canceled". Closing the
+	// socket makes ReadMessage return, unwinding runOnce so Run can exit.
+	stopWatch := make(chan struct{})
+	defer close(stopWatch)
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = conn.Close()
+		case <-stopWatch:
+		}
+	}()
 
 	// Fresh connection: fall back to legacy framing until the peer proves
 	// protobuf support, then upgrade mid-session at hello_ack.
@@ -389,7 +419,13 @@ func (c *Client) startTask(ctx context.Context, conn *websocket.Conn, task proto
 		return true
 	}
 
+	// Registered before the goroutine starts, and Done runs last (defers are
+	// LIFO), so waitRunningTasks sees the slot released only once the process
+	// group has been reaped. The read loop is the only Add site and it has
+	// already exited by the time anyone waits, so there is no Add/Wait race.
+	c.taskWG.Add(1)
 	go func() {
+		defer c.taskWG.Done()
 		defer cancel()
 		defer c.unregisterTask(task.ID)
 
@@ -400,6 +436,26 @@ func (c *Client) startTask(ctx context.Context, conn *websocket.Conn, task proto
 		}
 	}()
 	return true
+}
+
+// waitRunningTasks blocks until every in-flight task goroutine has exited, or
+// until timeout elapses. Only Run calls it, on the way out, after the read
+// loop is done — so no new task can be admitted while it waits.
+func (c *Client) waitRunningTasks(timeout time.Duration) {
+	done := make(chan struct{})
+	go func() {
+		c.taskWG.Wait()
+		close(done)
+	}()
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-done:
+	case <-timer.C:
+		c.logger.Warn("shutdown grace elapsed with tasks still running",
+			zap.Duration("grace", timeout))
+	}
 }
 
 // runCommand executes a single shell task and returns its result. The shell is
