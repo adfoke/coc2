@@ -17,6 +17,25 @@ type Plugin struct {
 	Path string `json:"path"`
 }
 
+// agentConnectedEvent is the plugin-facing view of an agent hello. It is
+// deliberately a separate type rather than the wire struct: the wire struct
+// carries Token, which authenticates the entire fleet, and plugins are local
+// executables that run without a sandbox (see plugins/README.md). Serialising
+// the wire struct handed that fleet-wide credential to anyone who could read
+// or replace a plugin. Everything a hook legitimately needs is here, so add
+// fields here explicitly — never pass AgentHello straight through.
+type agentConnectedEvent struct {
+	AgentID     string    `json:"agent_id"`
+	Hostname    string    `json:"hostname"`
+	OS          string    `json:"os"`
+	Arch        string    `json:"arch"`
+	IPAddrs     []string  `json:"ip_addrs,omitempty"`
+	Tags        []string  `json:"tags,omitempty"`
+	Fingerprint string    `json:"fingerprint,omitempty"`
+	Version     string    `json:"version"`
+	ConnectedAt time.Time `json:"connected_at"`
+}
+
 type PluginManager struct {
 	logger  *zap.Logger
 	plugins []Plugin

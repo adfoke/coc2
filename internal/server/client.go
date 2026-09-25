@@ -96,7 +96,17 @@ func (a *agentConn) readLoop() {
 					a.service.logger.Warn("mark dispatched", zap.String("task_id", task.ID), zap.Error(err))
 				}
 			}
-			a.service.plugins.Trigger("agent_connected", hello)
+			a.service.plugins.Trigger("agent_connected", agentConnectedEvent{
+				AgentID:     hello.AgentID,
+				Hostname:    hello.Hostname,
+				OS:          hello.OS,
+				Arch:        hello.Arch,
+				IPAddrs:     hello.IPAddrs,
+				Tags:        hello.Tags,
+				Fingerprint: hello.Fingerprint,
+				Version:     hello.Version,
+				ConnectedAt: hello.ConnectedAt,
+			})
 			a.service.logger.Info("agent connected", zap.String("agent_id", hello.AgentID), zap.String("hostname", hello.Hostname))
 			a.service.auditAgentEvent(a, agentEvent{
 				Kind:    "connect",
