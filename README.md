@@ -274,8 +274,10 @@ internal/common                    # ID / 分块 / 校验和 / 主机信息
 proto/coc2/v1/wire.proto        # 线协议单一事实源
 docs/                              # ai-usage（AI 契约）· refactor-plan（v2 改造全记录）· mvp
 plugins/  scripts/  config.yaml    # 插件样例 · 生成脚本 · 默认配置
+LICENSE                            # MIT
 ```
 
 ## 许可
 
-待定（仓库暂无 LICENSE 文件）。
+[MIT](LICENSE) © 2026 adfoke —— 允许商用、修改、再发布，唯一要求是保留版权与许可声明。
+软件按"现状"提供，不含任何担保。第三方依赖各自的许可见 `go.mod`。
