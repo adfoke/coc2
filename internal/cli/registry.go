@@ -314,6 +314,12 @@ func (r *Registry) emitSchema(g *Globals) int {
 			"concurrent_tasks_per_agent": common.MaxConcurrentTasks,
 			"concurrent_tasks_note": "dispatches beyond this are answered with a failed result " +
 				"(\"agent is already running the maximum number of tasks\"), never silently dropped",
+			// Plugin hooks are operator-written programs, so the budget is part
+			// of what they need to know before writing one.
+			"plugin_hook_timeout_secs": int(common.PluginHookTimeout.Seconds()),
+			"plugin_hook_timeout_note": "one plugin hook may run this long per event before the " +
+				"server kills its process tree; a plugin that backgrounds a process and exits " +
+				"is reported (\"plugin hook left processes behind\") and that process is killed too",
 		},
 		GlobalFlags: []FlagSpec{
 			{Name: "server", Type: "string", Default: DefaultTarget(), Desc: "operator plane unix socket path or http(s) URL; env COC2_SERVER"},
