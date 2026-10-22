@@ -215,8 +215,15 @@ func (c *Client) Do(method, path string, body any, out any) error {
 	}
 
 	switch {
-	case resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden:
+	case resp.StatusCode == http.StatusUnauthorized:
 		return fail("unauthorized", serverMessage(payload), ExitAuth)
+	case resp.StatusCode == http.StatusForbidden:
+		// 403 is overloaded: the server answers "unauthorized" with 401, so a
+		// 403 here is a decision, not a credential problem — today that is a
+		// task_dispatch plugin refusing the command. Reporting it as ExitAuth
+		// sent a caller (and an AI caller especially) to re-check its token
+		// when the token was fine. The body's denied fields are the evidence.
+		return fail("denied", serverMessage(payload), ExitFailure)
 	case resp.StatusCode >= 400:
 		return fail("server", fmt.Sprintf("%s %s: %d %s", method, path, resp.StatusCode, serverMessage(payload)), ExitFailure)
 	}
@@ -231,10 +238,26 @@ func (c *Client) Do(method, path string, body any, out any) error {
 
 func serverMessage(payload []byte) string {
 	var v struct {
-		Error string `json:"error"`
+		Error    string `json:"error"`
+		DeniedBy string `json:"denied_by"`
+		Reason   string `json:"deny_reason"`
 	}
-	if json.Unmarshal(payload, &v) == nil && v.Error != "" {
-		return v.Error
+	if json.Unmarshal(payload, &v) == nil {
+		if v.Error != "" {
+			return v.Error
+		}
+		// A policy denial: name the plugin and its reason, since that is the
+		// whole of what the caller needs to act on.
+		if v.DeniedBy != "" || v.Reason != "" {
+			switch {
+			case v.DeniedBy != "" && v.Reason != "":
+				return "denied by " + v.DeniedBy + ": " + v.Reason
+			case v.DeniedBy != "":
+				return "denied by " + v.DeniedBy
+			default:
+				return "denied: " + v.Reason
+			}
+		}
 	}
 	msg := strings.TrimSpace(string(payload))
 	if len(msg) > 200 {

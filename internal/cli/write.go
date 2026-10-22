@@ -3,6 +3,7 @@ package cli
 import (
 	"fmt"
 	"net/url"
+	"strings"
 	"time"
 )
 
@@ -71,6 +72,33 @@ type dispatchResponse struct {
 	AgentID    string `json:"agent_id"`
 	Dispatched bool   `json:"dispatched"`
 	QueuedOnly bool   `json:"queued_only"`
+
+	// A task_dispatch plugin refused this target's task. The batch endpoint is
+	// still 202 (it processed the request; some items were refused), so this is
+	// the only place a fan-out learns that a target was denied — and a denial
+	// must never look like "queued for a busy agent".
+	Denied     bool   `json:"denied,omitempty"`
+	DeniedBy   string `json:"denied_by,omitempty"`
+	DenyReason string `json:"deny_reason,omitempty"`
+}
+
+// deniedError turns one or more policy denials into the CLI's error envelope.
+// The message names the plugin and its reason (that is the whole of what the
+// caller can act on) and the code is "denied" rather than "unauthorized" — the
+// credential was fine, the command was refused.
+func deniedError(denied []dispatchResponse) error {
+	parts := make([]string, 0, len(denied))
+	for _, d := range denied {
+		msg := d.AgentID
+		if d.DeniedBy != "" {
+			msg += ": denied by " + d.DeniedBy
+		}
+		if d.DenyReason != "" {
+			msg += ": " + d.DenyReason
+		}
+		parts = append(parts, msg)
+	}
+	return fail("denied", strings.Join(parts, "; "), ExitFailure)
 }
 
 // defaultFanoutSpread is the stagger window `run` applies when it fans out and
@@ -160,13 +188,44 @@ func addWriteCommands(r *Registry) {
 				return err
 			}
 
+			// A denied task has no id to poll and no row to read: it was
+			// refused before it existed. Reporting "all_ok" without it, or
+			// polling a task that is not there, would both be wrong — so a
+			// denial is its own outcome, reported per target, and it fails the
+			// command. (The token is fine; the command is what was refused, so
+			// this is a task failure, not an auth failure.)
+			var denied []dispatchResponse
+			accepted := make([]dispatchResponse, 0, len(resp.Tasks))
+			for _, t := range resp.Tasks {
+				if t.Denied {
+					denied = append(denied, t)
+					continue
+				}
+				accepted = append(accepted, t)
+			}
+
 			if !cf.Bool("wait") {
-				return Emit(g.Stdout, map[string]any{"tasks": resp.Tasks}, g.Pretty)
+				if err := Emit(g.Stdout, map[string]any{"tasks": resp.Tasks}, g.Pretty); err != nil {
+					return err
+				}
+				if len(denied) > 0 {
+					return deniedError(denied)
+				}
+				return nil
 			}
 
 			results := make([]map[string]any, 0, len(resp.Tasks))
-			allOK := true
-			for _, t := range resp.Tasks {
+			for _, t := range denied {
+				results = append(results, map[string]any{
+					"task_id":     t.TaskID,
+					"agent_id":    t.AgentID,
+					"state":       "denied",
+					"denied_by":   t.DeniedBy,
+					"deny_reason": t.DenyReason,
+				})
+			}
+			allOK := len(denied) == 0
+			for _, t := range accepted {
 				env, err := poll[taskEnvelope](g, "/api/v1/tasks/"+url.PathEscape(t.TaskID), cf.Duration("wait-timeout"),
 					func(e taskEnvelope) bool { return taskTerminal(e.State) })
 				if err != nil {
@@ -187,6 +246,9 @@ func addWriteCommands(r *Registry) {
 			}
 			if err := Emit(g.Stdout, map[string]any{"all_ok": allOK, "results": results}, g.Pretty); err != nil {
 				return err
+			}
+			if len(denied) > 0 {
+				return deniedError(denied)
 			}
 			if !allOK {
 				return fail("task_failed", "one or more tasks did not succeed", ExitFailure)

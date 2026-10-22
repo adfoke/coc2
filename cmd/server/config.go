@@ -19,6 +19,7 @@ func defaultServerConfig() server.Config {
 		AuthToken:          "coc2-dev-token",
 		DBPath:             "coc2.db",
 		PluginDir:          "plugins",
+		PluginsEnvelope:    1,
 		WriteWait:          10 * time.Second,
 		PongWait:           70 * time.Second,
 		PingPeriod:         25 * time.Second,
@@ -40,6 +41,7 @@ func loadServerConfig(args []string) (server.Config, error) {
 	apiToken := cfg.APIToken
 	dbPath := cfg.DBPath
 	pluginDir := cfg.PluginDir
+	pluginsEnvelope := cfg.PluginsEnvelope
 	tlsCert := cfg.TLSCertFile
 	tlsKey := cfg.TLSKeyFile
 	clientCA := cfg.ClientCAFile
@@ -59,6 +61,7 @@ func loadServerConfig(args []string) (server.Config, error) {
 	fs.StringVar(&apiToken, "api-token", apiToken, "operator plane token, defaults to -token")
 	fs.StringVar(&dbPath, "db", dbPath, "sqlite db path")
 	fs.StringVar(&pluginDir, "plugins", pluginDir, "plugin directory")
+	fs.IntVar(&pluginsEnvelope, "plugins-envelope", pluginsEnvelope, "payload shape for executable plugins: 1 (raw payload) or 2 (event envelope with hint/ref); JavaScript plugins always get 2")
 	fs.StringVar(&tlsCert, "tls-cert", tlsCert, "tls cert file")
 	fs.StringVar(&tlsKey, "tls-key", tlsKey, "tls key file")
 	fs.StringVar(&clientCA, "client-ca", clientCA, "client ca file")
@@ -103,6 +106,9 @@ func loadServerConfig(args []string) (server.Config, error) {
 	}
 	if visited["plugins"] {
 		cfg.PluginDir = pluginDir
+	}
+	if visited["plugins-envelope"] {
+		cfg.PluginsEnvelope = pluginsEnvelope
 	}
 	if visited["tls-cert"] {
 		cfg.TLSCertFile = tlsCert

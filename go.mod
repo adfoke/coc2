@@ -3,6 +3,7 @@ module coc2
 go 1.27
 
 require (
+	github.com/Calcium-Ion/moejs v0.1.0-alpha.9
 	github.com/gin-gonic/gin v1.11.0
 	github.com/goccy/go-yaml v1.18.0
 	github.com/gorilla/websocket v1.5.3

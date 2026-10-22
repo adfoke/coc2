@@ -314,12 +314,33 @@ func (r *Registry) emitSchema(g *Globals) int {
 			"concurrent_tasks_per_agent": common.MaxConcurrentTasks,
 			"concurrent_tasks_note": "dispatches beyond this are answered with a failed result " +
 				"(\"agent is already running the maximum number of tasks\"), never silently dropped",
-			// Plugin hooks are operator-written programs, so the budget is part
-			// of what they need to know before writing one.
+			// Plugin hooks are operator-written, so the budget is part of what
+			// they need to know before writing one.
 			"plugin_hook_timeout_secs": int(common.PluginHookTimeout.Seconds()),
-			"plugin_hook_timeout_note": "one plugin hook may run this long per event before the " +
-				"server kills its process tree; a plugin that backgrounds a process and exits " +
-				"is reported (\"plugin hook left processes behind\") and that process is killed too",
+			"plugin_hook_timeout_note": "one asynchronous plugin hook may run this long per " +
+				"event before the server interrupts it (a JavaScript plugin) or kills its " +
+				"process tree (an executable plugin)",
+			// The decision budget is the one number a policy plugin author has to
+			// design against, and the one an operator has to know to interpret
+			// "the gate let it through anyway".
+			"plugin_decision_timeout_secs": common.PluginDecisionTimeout.Seconds(),
+			"plugin_decision_timeout_note": "the task_dispatch hook runs synchronously before a " +
+				"task is persisted; this is the whole budget for the plugin chain, and running " +
+				"out of it ALLOWS the task (fail open) with an audit row saying decision=timeout",
+			"plugin_max_concurrent_hooks": common.PluginMaxConcurrentHooks,
+			"plugin_max_concurrent_hooks_note": "asynchronous hooks past this many in flight are " +
+				"dropped with a warning; the synchronous task_dispatch hook waits instead of dropping",
+			"plugin_max_runtimes_per_plugin": common.PluginMaxRuntimesPerPlugin,
+			"plugin_memory_limit_bytes":      common.PluginMemoryLimitBytes,
+			"plugin_memory_limit_note": "per-call allocation cap inside one JavaScript plugin " +
+				"runtime, enforced as an interrupt the script cannot catch",
+			"plugin_event_ttl_secs": int(common.PluginEventTTL.Seconds()),
+			"plugin_event_ttl_note": "how long an event id from an envelope keeps resolving via " +
+				"ref / GET /api/v1/events/:id / coc2.event(id); after that it is 404",
+			"plugin_envelope_schema": 2,
+			"plugin_envelope_note": "JavaScript plugins always receive this envelope; executable " +
+				"plugins receive it when the server runs with -plugins-envelope=2, plus " +
+				"COC2_PLUGIN_ENVELOPE=2 in their environment",
 		},
 		GlobalFlags: []FlagSpec{
 			{Name: "server", Type: "string", Default: DefaultTarget(), Desc: "operator plane unix socket path or http(s) URL; env COC2_SERVER"},

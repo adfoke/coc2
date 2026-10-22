@@ -41,7 +41,17 @@ func newWriteRegistry(t *testing.T) (*Registry, *httptest.Server) {
 			case "stuck":
 				id = "t-stuck"
 			}
-			tasks = append(tasks, map[string]any{"task_id": id, "agent_id": fmt.Sprintf("a%d", i), "dispatched": true})
+			task := map[string]any{"task_id": id, "agent_id": fmt.Sprintf("a%d", i), "dispatched": true}
+			if req.Command == "forbidden" {
+				// The server's shape for one refused target: 202 overall, the
+				// denial carried per task.
+				task = map[string]any{
+					"task_id": id, "agent_id": fmt.Sprintf("a%d", i),
+					"dispatched": false, "queued_only": false,
+					"denied": true, "denied_by": "policy.js", "deny_reason": "destructive command",
+				}
+			}
+			tasks = append(tasks, task)
 		}
 		_ = json.NewEncoder(w).Encode(map[string]any{"count": len(tasks), "tasks": tasks})
 	})
@@ -149,6 +159,53 @@ func TestRunFanOutRequiresYes(t *testing.T) {
 	// With --yes it passes.
 	if code, _, err := runWait(t, r, ts, "run", "--cmd", "uptime", "--agents", "a1,a2", "--yes"); code != ExitOK {
 		t.Fatalf("fan-out with --yes: code=%d err=%s", code, err)
+	}
+}
+
+// TestRunReportsPolicyDenial pins the new outcome on the CLI side. The batch
+// endpoint answers 202 for a refusal (it did process the request), so without
+// reading the per-task flag a fan-out would report `all_ok` for a command that
+// never ran anywhere — the exact confusion "denied" and "queued" must not have.
+func TestRunReportsPolicyDenial(t *testing.T) {
+	r, ts := newWriteRegistry(t)
+
+	code, stdout, stderr := runWait(t, r, ts, "run", "--cmd", "forbidden", "--agents", "a1")
+	if code != ExitFailure {
+		t.Fatalf("code=%d want %d (stdout=%s stderr=%s)", code, ExitFailure, stdout, stderr)
+	}
+	if !strings.Contains(stderr, "denied") || !strings.Contains(stderr, "policy.js") {
+		t.Fatalf("stderr must name the denial: %s", stderr)
+	}
+	if !strings.Contains(stdout, `"denied":true`) {
+		t.Fatalf("stdout must still carry the per-task rows: %s", stdout)
+	}
+
+	// With --wait the denial is its own state, and no poll is issued for a task
+	// that has no row.
+	code, stdout, stderr = runWait(t, r, ts, "run", "--cmd", "forbidden", "--agents", "a1",
+		"--wait", "--wait-timeout", "10s")
+	if code != ExitFailure {
+		t.Fatalf("--wait code=%d want %d (stderr=%s)", code, ExitFailure, stderr)
+	}
+	var doc struct {
+		AllOK   bool `json:"all_ok"`
+		Results []struct {
+			State      string `json:"state"`
+			DeniedBy   string `json:"denied_by"`
+			DenyReason string `json:"deny_reason"`
+		} `json:"results"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &doc); err != nil {
+		t.Fatalf("stdout not JSON: %v (%s)", err, stdout)
+	}
+	if doc.AllOK {
+		t.Fatal("all_ok must be false when a target was denied")
+	}
+	if len(doc.Results) != 1 || doc.Results[0].State != "denied" || doc.Results[0].DeniedBy != "policy.js" {
+		t.Fatalf("unexpected results: %s", stdout)
+	}
+	if doc.Results[0].DenyReason == "" {
+		t.Fatalf("the reason is the actionable part: %s", stdout)
 	}
 }
 

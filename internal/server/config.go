@@ -24,6 +24,15 @@ type Config struct {
 	DBPath     string `yaml:"db"`
 	PluginDir  string `yaml:"plugins"`
 
+	// PluginsEnvelope is the payload shape handed to *executable* plugins:
+	// 1 (the raw hook payload, the original contract) or 2 (the schema-2
+	// event envelope with hint/ref). JavaScript plugins always get 2.
+	//
+	// It defaults to 1 so an existing plugin directory keeps working after an
+	// upgrade; -plugins-envelope=2 is the migration step, and 1 is the escape
+	// hatch afterwards (docs/plugin-refactor.md §3.4).
+	PluginsEnvelope int `yaml:"plugins_envelope"`
+
 	// OperatorUDSPath is the Unix socket serving the operator (CLI/API)
 	// plane. It defaults to ./coc2.sock; filesystem permissions are the
 	// access boundary, so no token is required on this plane.

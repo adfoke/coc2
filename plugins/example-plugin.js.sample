@@ -1,0 +1,44 @@
+// 示例插件：把 .sample 去掉、放进 -plugins 目录、重启 server 即可。
+//
+// 这个文件同时是文档：下面每个 hook 都示范了"只看 hint"和"真要正文才取"两条路。
+
+// task_dispatch 是唯一同步的 hook，也是唯一能改变结果的 hook。
+// 它在任务落库之前跑，有 200 ms 预算 —— 超时会被当成 allow。
+export function task_dispatch(event) {
+  const cmd = event.hint.command;
+
+  // 命令被截断过就别基于半截内容做拦截判断了（8 KiB 以上的命令行本身就不正常）。
+  if (event.hint.command_truncated) {
+    return { decision: "deny", reason: "command is too long to be reviewed" };
+  }
+
+  const blocked = ["rm -rf /", "mkfs", "shutdown", ":(){ :|:& };:"];
+  for (const pattern of blocked) {
+    if (cmd.includes(pattern)) {
+      return { decision: "deny", reason: `blocked pattern ${JSON.stringify(pattern)}` };
+    }
+  }
+  return { decision: "allow" };
+}
+
+// task_result 是通知：结果已经发生，拦它只会丢数据。
+export function task_result(event) {
+  const { task_id, agent_id, status, exit_code, stdout_bytes } = event.hint;
+
+  if (status === "ok" && exit_code === 0) {
+    console.log(`ok ${task_id} on ${agent_id} (${stdout_bytes}B)`);
+    return;
+  }
+
+  // 只在失败时取正文：coc2.event 拿到的就是 envelope 的 ref 指向的那份字节。
+  const full = JSON.parse(coc2.event(event.id));
+  console.log(`failed ${task_id} exit=${exit_code}: ${full.stderr.slice(0, 500)}`);
+}
+
+// metrics_report 每 agent 每 30 秒一次 —— 别在这里做重活。
+export function metrics_report(event) {
+  const free = event.hint.root_disk_free_bytes ?? 0;
+  if (free < 1 << 30) {
+    console.log(`low disk on ${event.hint.agent_id}: ${free} bytes`);
+  }
+}

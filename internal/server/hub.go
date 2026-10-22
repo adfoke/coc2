@@ -148,6 +148,13 @@ type taskDispatchResponse struct {
 	AgentID    string `json:"agent_id"`
 	Dispatched bool   `json:"dispatched"`
 	QueuedOnly bool   `json:"queued_only"`
+
+	// A task_dispatch plugin may refuse a task before it is ever persisted.
+	// TaskID is then the id that would have been used: it correlates the
+	// operator's request with the audit row, and no task row exists for it.
+	Denied     bool   `json:"denied,omitempty"`
+	DeniedBy   string `json:"denied_by,omitempty"`
+	DenyReason string `json:"deny_reason,omitempty"`
 }
 
 var upgrader = websocket.Upgrader{
@@ -207,7 +214,11 @@ func New(cfg Config, logger *zap.Logger) (*Service, error) {
 		return nil, err
 	}
 	svc.store = store
-	plugins, err := NewPluginManager(cfg.PluginDir, logger)
+	envelope := cfg.PluginsEnvelope
+	if envelope == 0 {
+		envelope = 1
+	}
+	plugins, err := NewPluginManagerWithOptions(cfg.PluginDir, logger, PluginOptions{Envelope: envelope})
 	if err != nil {
 		return nil, err
 	}
@@ -441,6 +452,20 @@ func (s *Service) operatorRoutes() *gin.Engine {
 		c.JSON(http.StatusOK, s.plugins.List())
 	})
 
+	// The event body behind a plugin envelope's ref. An id is a capability
+	// issued by this server for a bounded time (common.PluginEventTTL): it is
+	// not a path and cannot address anything but a retained event. 404 covers
+	// never-issued, expired and evicted with one answer, which is the only
+	// distinction a caller needs.
+	engine.GET("/api/v1/events/:id", func(c *gin.Context) {
+		payload, ok := s.plugins.EventPayload(c.Param("id"))
+		if !ok {
+			c.JSON(http.StatusNotFound, gin.H{"error": errPluginEventNotFound.Error()})
+			return
+		}
+		c.Data(http.StatusOK, "application/json", payload)
+	})
+
 	engine.GET("/api/v1/groups", func(c *gin.Context) {
 		groups, err := s.store.Groups()
 		if err != nil {
@@ -522,6 +547,12 @@ func (s *Service) operatorRoutes() *gin.Engine {
 		resp, err := s.createTask(req.AgentID, req.Command, req.TimeoutSecs, req.Priority, time.Time{})
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+		if resp.Denied {
+			// 403, not 202: the caller has to be able to tell "queued for a
+			// busy agent" from "refused by policy" without parsing the body.
+			c.JSON(http.StatusForbidden, resp)
 			return
 		}
 		c.JSON(http.StatusAccepted, resp)
@@ -961,6 +992,31 @@ func (s *Service) createTask(agentID, command string, timeoutSecs, priority int,
 		CreatedAt:   time.Now().UTC(),
 	}
 
+	// The gate: a task_dispatch plugin may refuse this task before it exists.
+	//
+	// It runs here — once, at admission — rather than on the deferred/requeue
+	// paths, because the decision is about "the operator asked for this", not
+	// about "the agent is free now". Gating again on dispatch would let the
+	// same task be denied after its id was already handed back to the caller,
+	// which is worse than either answer on its own.
+	decision := s.plugins.Decide(context.Background(), "task_dispatch", task, common.PluginDecisionTimeout)
+	if decision.Decision != decisionAllow {
+		// Every non-plain outcome is audited, including the fail-open ones.
+		// A timeout that allowed the task anyway is exactly the thing an
+		// operator has to be able to find later ("why did the blocklist not
+		// stop this?").
+		s.recordDispatchDecision(task, decision)
+	}
+	if !decision.Allowed {
+		return taskDispatchResponse{
+			TaskID:     task.ID,
+			AgentID:    task.AgentID,
+			Denied:     true,
+			DeniedBy:   decision.Plugin,
+			DenyReason: decision.Reason,
+		}, nil
+	}
+
 	dispatched, err := s.dispatchOrQueue(task, releaseAt)
 	if err != nil {
 		return taskDispatchResponse{}, err
@@ -971,6 +1027,50 @@ func (s *Service) createTask(agentID, command string, timeoutSecs, priority int,
 		Dispatched: dispatched,
 		QueuedOnly: !dispatched,
 	}, nil
+}
+
+// recordDispatchDecision writes a plugin's task_dispatch outcome to the audit
+// trail. A denial is a control-plane decision about an operator's command, so it
+// belongs in the same table as the dispatch it replaces — otherwise "the task
+// never ran" has no record at all.
+//
+// The actor is the plugin, not the operator: the operator did ask for the task,
+// and the row has to say who refused it.
+func (s *Service) recordDispatchDecision(task protocol.Task, decision PluginDecision) {
+	status := http.StatusOK // fail-open outcomes let the task through
+	ok := true
+	summary := "decision=" + decision.Decision
+	if !decision.Allowed {
+		status = http.StatusForbidden
+		ok = false
+	}
+	if decision.Reason != "" {
+		summary += " reason=" + truncateForLog(decision.Reason, oplogMaxSummaryChars)
+	}
+	if decision.Plugin != "" {
+		summary = "plugin=" + decision.Plugin + " " + summary
+	}
+	command, truncated := truncateBytes(task.Command, oplogMaxSummaryChars)
+	summary += " command=" + command
+	if truncated {
+		summary += "…"
+	}
+
+	s.appendOpLog(OpLogEntry{
+		RequestID:     common.NewID(),
+		TS:            time.Now().UTC(),
+		Plane:         "plugin",
+		Actor:         decision.Plugin,
+		UID:           -1,
+		PID:           -1,
+		Method:        "HOOK",
+		Path:          "task_dispatch",
+		Status:        status,
+		OK:            ok,
+		Ref:           task.ID,
+		Agents:        []string{task.AgentID},
+		ParamsSummary: summary,
+	})
 }
 
 // agentIDPattern constrains target agent ids to a conservative charset:

@@ -58,6 +58,13 @@ func newFakeRegistry(t *testing.T) (*Registry, *httptest.Server) {
 		}
 		_, _ = w.Write([]byte(`{"ok":true}`))
 	})
+	// A task_dispatch plugin refusing a command: 403 with the denial fields,
+	// not a 401. It must not read as an auth failure.
+	mux.HandleFunc("POST /api/v1/denied", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`{"task_id":"t-1","agent_id":"a1","denied":true,` +
+			`"denied_by":"policy.js","deny_reason":"destructive command"}`))
+	})
 	ts := httptest.NewServer(mux)
 	t.Cleanup(ts.Close)
 
@@ -68,6 +75,16 @@ func newFakeRegistry(t *testing.T) (*Registry, *httptest.Server) {
 		Run: func(g *Globals, _ *CmdFlags) error {
 			var out map[string]any
 			if err := g.Client.Get("/api/v1/protected", &out); err != nil {
+				return err
+			}
+			return Emit(g.Stdout, out, g.Pretty)
+		},
+	})
+	r.Add(&Command{
+		Name: "denied post",
+		Run: func(g *Globals, _ *CmdFlags) error {
+			var out map[string]any
+			if err := g.Client.Post("/api/v1/denied", map[string]any{}, &out); err != nil {
 				return err
 			}
 			return Emit(g.Stdout, out, g.Pretty)
@@ -179,6 +196,36 @@ func TestAuthFailureExit3(t *testing.T) {
 	// With token -> success.
 	if code, _, _ := run(t, r, "-server", ts.URL, "-token", "tok123", "protected", "get"); code != ExitOK {
 		t.Fatalf("tokened code=%d want 0", code)
+	}
+}
+
+// TestPolicyDenialIsNotAnAuthFailure pins the exit-code contract for the new
+// 403: a denied command is a decision, not a credential problem. Reporting it
+// as ExitAuth sent callers to re-check a token that was fine.
+func TestPolicyDenialIsNotAnAuthFailure(t *testing.T) {
+	r, ts := newFakeRegistry(t)
+	code, stdout, stderr := run(t, r, "-server", ts.URL, "denied", "post")
+	if code != ExitFailure {
+		t.Fatalf("code=%d want %d (stderr=%s)", code, ExitFailure, stderr)
+	}
+	if stdout != "" {
+		t.Fatalf("a denial must not touch stdout: %q", stdout)
+	}
+	var doc struct {
+		Error struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal([]byte(stderr), &doc); err != nil {
+		t.Fatalf("stderr not JSON: %s", stderr)
+	}
+	if doc.Error.Code != "denied" {
+		t.Fatalf("error code = %q, want denied", doc.Error.Code)
+	}
+	// The plugin's own words are the actionable part.
+	if !strings.Contains(doc.Error.Message, "policy.js") || !strings.Contains(doc.Error.Message, "destructive") {
+		t.Fatalf("message %q does not name the plugin and its reason", doc.Error.Message)
 	}
 }
 

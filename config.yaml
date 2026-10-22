@@ -3,6 +3,11 @@ token: "coc2-dev-token"
 api_token: "coc2-api-token"
 db: "./data/coc2.db"
 plugins: "./plugins"
+# Payload shape for *executable* plugins: 1 = the raw hook payload (original
+# contract), 2 = the event envelope {schema, event, id, at, ref, hint}.
+# JavaScript plugins always get 2. Default 1 so an existing plugin directory
+# keeps working after an upgrade.
+plugins_envelope: 1
 tls_cert: ""
 tls_key: ""
 client_ca: ""
