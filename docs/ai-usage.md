@@ -57,6 +57,14 @@ coc2 run --cmd "df -h" --tag env=prod --yes --wait --exec-timeout 30
 
 不 `--wait` 时立即返回 `{"tasks":[{task_id,agent_id,dispatched,queued_only}]}`；`queued_only=true` 表示 agent 离线、任务待补发。之后用 `coc2 tasks get <id>` 轮询。
 
+**被策略插件拦下时是 403**：`{"task_id":..,"denied":true,"denied_by":"policy.js","deny_reason":".."}`。
+它跟 `queued_only` 的区别是"没被接受"而不是"还没送达"——不要重试，重试还是被拒。
+任务没有落库，`tasks get` 查不到。
+
+`coc2` CLI 退出码是 **`failure`（1）**，`stderr` 的 `error.code` 是 **`denied`**、
+`error.message` 是 `denied by <plugin>: <reason>`。
+注意**不是** `auth`（3）—— token 没问题，是命令被策略拒了（服务端的鉴权失败才是 401/`auth`）。
+
 ### 文件
 
 ```bash

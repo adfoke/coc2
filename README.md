@@ -55,7 +55,7 @@ export COC2_TOKEN=$(openssl rand -hex 32)
 - 操作审计（`oplog`）：每条写操作记录谁（UDS 内核凭据 uid→用户名 / TCP token 身份）、从哪（peer pid / socket / IP）、做了什么、结果如何；认证失败同样落库。Agent 面不只记失败——已认证 agent 的**连接、断开、任务结果、传输终态**也各落一行（含结果是否被采纳），所以"真 agent 干的"和"伪造的"事后可区分。断开行带会话时长，并区分"会话结束"与"被新连接顶替"（重连时旧会话结束但 agent 仍在线）；`coc2 audit list` 查询
 - 基础监控上报 + 指标历史（每 Agent 最近 1000 条）
 - 运行日志可落盘并按大小轮转（`log_file` / `log_level` / `log_max_*`，默认 stderr）；审计历史保留可配（`audit_retention_days`，默认 **14 天**，设为 `0` 则永久保留）
-- 本地可执行文件插件钩子（[plugins/README.md](plugins/README.md)）
+- 插件钩子（[plugins/README.md](plugins/README.md)）：**JavaScript 插件**跑在进程内（moejs，每插件独立 runtime + 32 MiB 内存上限 + 可中断死循环），可执行文件插件仍支持但已弃用
 - CLI：紧凑 JSON / 退出码契约 / 无交互 / `--wait` 阻塞收结果 / `schema` 自描述
 
 ## 架构
@@ -84,7 +84,7 @@ flowchart LR
 
     sock[("coc2.sock")]
     db[("SQLite")]
-    hook["本地插件"]
+    hook["插件（JS runtime / 可执行）"]
 
     operator --> cli
     cli --> sock
@@ -147,7 +147,8 @@ Go 缓存默认落在仓库本地 `.gocache_local/`、`.gomodcache_local/`，可
 | `-api-token` | `api_token` | 同 `-token` | Operator 面 TCP 的 token |
 | `-allow-dev-token` | `allow_dev_token` | `false` | 允许用内置开发 token 启动（仅限本地一次性运行） |
 | `-db` | `db` | `coc2.db` | SQLite 路径 |
-| `-plugins` | `plugins` | `plugins` | 插件目录 |
+| `-plugins` | `plugins` | `plugins` | 插件目录（`*.js` 走进程内引擎，可执行文件走老契约） |
+| `-plugins-envelope` | `plugins_envelope` | `1` | 给**可执行**插件的负载形状：`1` 原样 / `2` 事件信封（`hint`+`ref`）。JS 插件永远是 `2` |
 | `-tls-cert` / `-tls-key` | `tls_cert` / `tls_key` | 空 | 启用 TLS 1.3 |
 | `-client-ca` | `client_ca` | 空 | 开启 mTLS |
 | `-require-tls` | `require_tls` | `false` | 无 TLS 配置时拒绝启动 |
@@ -216,7 +217,7 @@ curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8081/api/v1/tasks   # op
 | GET/POST | `/api/v1/groups` · `/api/v1/groups/:id` | 分组（POST 全量替换语义） |
 | GET/POST | `/api/v1/tasks` · `/api/v1/tasks/batch` · `/:id` · `/:id/cancel` | 任务 |
 | POST | `/api/v1/files/upload` · `/api/v1/files/download` | 传输（`--local` 是 Server 侧路径） |
-| GET | `/api/v1/transfers` · `/:id` · `/api/v1/plugins` · `/api/v1/metrics/overview` | 只读 |
+| GET | `/api/v1/transfers` · `/:id` · `/api/v1/plugins` · `/api/v1/events/:id` · `/api/v1/metrics/overview` | 只读（`events/:id` 是插件信封里 `ref` 指向的事件正文，5 分钟后 404） |
 | GET | `/ws/agent` | Agent 长连接（仅 Agent 面） |
 
 ## 线协议
@@ -247,7 +248,30 @@ curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8081/api/v1/tasks   # op
 
 ## 插件
 
-Server 加载 `-plugins` 目录下可执行文件，事件 JSON 从 stdin 传入，钩子：`agent_connected` · `task_result` · `transfer_done` · `metrics_report`。样例见 [plugins/example-plugin.sh.sample](plugins/example-plugin.sh.sample)。
+`-plugins` 目录里放 `*.js` 就是 JavaScript 插件，跑在 server 进程内（[moejs](https://github.com/Calcium-Ion/moejs)，
+每个插件独立 runtime 池、32 MiB 内存上限、死循环可被中断）；放可执行文件则走原来的进程契约（已弃用）。
+
+```js
+export function task_dispatch(event) {           // 唯一同步、唯一能改变结果的钩子
+  if (event.hint.command.includes("rm -rf")) {
+    return { decision: "deny", reason: "destructive command" };
+  }
+}
+export function task_result(event) {             // 通知：结果已经发生了
+  const full = JSON.parse(coc2.event(event.id)); // 真要正文才取
+  console.log(full.stderr.slice(0, 200));
+}
+```
+
+- **钩子**：`agent_connected` · `task_result` · `transfer_done` · `metrics_report` · **`task_dispatch`**（新增，可 deny）。
+- **信封（schema 2）**：插件收到的是"事件的描述"而不是事件本身 —— `{schema, event, id, at, ref, hint}`。
+  `hint` 够做常见判断，正文按 `id`/`ref` 取（`coc2.event(id)` 或 `GET /api/v1/events/<id>`）。
+  这样 1 MiB 的 stdout 不会因为"每个插件来一份"落进 server 的堆。
+- **边界**：`task_dispatch` 有 200 ms 预算，**超时/报错一律放行（fail open）并写审计**；
+  其余钩子异步、不等结果。异步钩子超过并发上限会**丢弃并记 warn**。
+- 细节、字段清单和边界表：[plugins/README.md](plugins/README.md)。样例：
+  [plugins/example-plugin.js.sample](plugins/example-plugin.js.sample)（新）·
+  [plugins/example-plugin.sh.sample](plugins/example-plugin.sh.sample)（老）。
 
 ## 已知限制
 
@@ -258,9 +282,11 @@ Server 加载 `-plugins` 目录下可执行文件，事件 JSON 从 stdin 传入
 - **单 Agent 并发上限 16**：超出的派发立刻回一个 `failed` 结果（`agent is already running the maximum
   number of tasks`），不会静默丢弃
 - 监控为基础指标（无 CPU/内存占用率、无进程级），历史每 Agent 封顶 1000 条
-- 插件是本地可执行文件钩子，无沙箱隔离、无热重载
+- **插件不是安全沙箱**：JS 插件关掉了文件系统/网络/`eval`，但**没有**换回崩溃隔离 ——
+  引擎自身的 bug 能打到 server。需要独立崩溃域就别用插件，或者写一个把自己隔离的外部服务。
+  插件无热重载（改完要重启）。
 - 传输失败保留 `.part` 供续传（同一目标路径视为同一任务）
-- 后续方向见 [docs/mvp.md](docs/mvp.md)（Phase 2/3：完整指标、插件隔离）
+- 后续方向见 [docs/mvp.md](docs/mvp.md)
 
 ## 仓库结构
 
@@ -272,7 +298,8 @@ internal/protocol  internal/protocol/pb   # 手写编解码层 / protoc 生成�
 internal/cli                       # 操控端（registry + 命令 + HTTP client）
 internal/common                    # ID / 分块 / 校验和 / 主机信息
 proto/coc2/v1/wire.proto        # 线协议单一事实源
-docs/                              # ai-usage（AI 契约）· refactor-plan（v2 改造全记录）· mvp
+docs/                              # ai-usage（AI 契约）· refactor-plan（v2 改造全记录）
+                                   # plugin-refactor（插件接口改造：形状 → 可回值 → 引擎）· mvp
 plugins/  scripts/  config.yaml    # 插件样例 · 生成脚本 · 默认配置
 LICENSE                            # MIT
 ```
