@@ -153,7 +153,7 @@ func TestDocumentedExamplePluginLoads(t *testing.T) {
 	dir := t.TempDir()
 	writeJSPlugin(t, dir, "example.js", string(source))
 
-	pm, _ := newObservedManager(t, dir)
+	pm, logs := newObservedManager(t, dir)
 	list := pm.List()
 	if len(list) != 1 {
 		t.Fatalf("loaded %d plugins, want 1: %+v", len(list), list)
@@ -178,6 +178,28 @@ func TestDocumentedExamplePluginLoads(t *testing.T) {
 	}, common.PluginDecisionTimeout)
 	if !decision.Allowed {
 		t.Fatalf("the example denied a harmless command: %+v", decision)
+	}
+
+	// The task_result branch decides from the hint alone on success, and only
+	// fetches the body on failure. Both halves are asserted through the console
+	// line, because that is the part a reader copies: the shipped example said
+	// `status === "ok"` while the protocol says "success", so every successful
+	// task took the failure path — fetching 1 MiB per event and logging
+	// "failed ... exit=0". Found by running the clone from GitHub, not by a test.
+	pm.Trigger("task_result", protocol.TaskResult{
+		TaskID: "t-ok", AgentID: "ag-1", Status: "success", ExitCode: 0,
+		Stdout: strings.Repeat("q", 4096),
+	})
+	if got := waitConsole(t, logs, "example.js", "ok "); !strings.Contains(got, "t-ok") {
+		t.Fatalf("%q: a successful result did not take the hint-only path", got)
+	}
+
+	pm.Trigger("task_result", protocol.TaskResult{
+		TaskID: "t-bad", AgentID: "ag-1", Status: "failed", ExitCode: 3, Stderr: "boom-detail",
+	})
+	got := waitConsole(t, logs, "example.js", "failed ")
+	if !strings.Contains(got, "t-bad") || !strings.Contains(got, "boom-detail") {
+		t.Fatalf("%q: the failure path did not fetch the body", got)
 	}
 }
 

@@ -25,7 +25,9 @@ export function task_dispatch(event) {
 export function task_result(event) {
   const { task_id, agent_id, status, exit_code, stdout_bytes } = event.hint;
 
-  if (status === "ok" && exit_code === 0) {
+  // status 的取值是 success / failed / canceled —— 不是 "ok"。
+  if (status === "success" && exit_code === 0) {
+    // 这一条只用了 hint，一个字节正文都没取。
     console.log(`ok ${task_id} on ${agent_id} (${stdout_bytes}B)`);
     return;
   }
